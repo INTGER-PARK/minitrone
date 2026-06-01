@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>minitrone_controller</name>
+  <version>0.0.1</version>
+  <description>Minitrone controller nodes</description>
+
+  <maintainer email="ryung9514@naver.com">ryung</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>minitrone_interfaces</depend>
+  <depend>std_msgs</depend>
+
+  <build_depend>eigen3_cmake_module</build_depend>
+  <build_depend>Eigen3</build_depend>
+  <exec_depend>Eigen3</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
