@@ -10,11 +10,12 @@ from ament_index_python.packages import get_package_share_directory
 import mujoco
 import mujoco.viewer
 
-from minitrone_interfaces.msg import Input, MinitroneState
+from minitrone_interfaces.msg import Input, MinitroneState, MobObserverInput, Wrench
 
 PHYSICS_HZ = 400.0
 ZETA = 0.02          # thrust = ZETA * omega^2  (minitrone allocator/plant convention)
 DELAY_TIME = 0.01
+EXTERNAL_WRENCH_CMD_TIMEOUT = 0.2
 RAD2DEG = 180.0 / math.pi
 
 SIG_POS   = 1e-3
@@ -80,6 +81,12 @@ class PlantRosNode(Node):
                 raise RuntimeError(f"Body '{name}' not found in XML")
             return int(idx)
 
+        def siteid(name: str) -> int:
+            idx = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name.encode())
+            if idx < 0:
+                raise RuntimeError(f"Site '{name}' not found in XML")
+            return int(idx)
+
         # ===================== MINITRONE actuators =====================
         # XML actuator names follow Palletrone.xml:
         #   general:  BLDC1..BLDC4
@@ -104,6 +111,12 @@ class PlantRosNode(Node):
 
         # for COM printing (use drone_base body)
         self.base_body_id = bid("drone_base")
+        self.prop_site_id = [
+            siteid("prop1_site"),
+            siteid("prop2_site"),
+            siteid("prop3_site"),
+            siteid("prop4_site"),
+        ]
 
         self.s_adr = self.model.sensor_adr
         self.s_dim = self.model.sensor_dim
@@ -118,10 +131,19 @@ class PlantRosNode(Node):
         self.prev_pub_t: Optional[float] = None
         self.prev_linvel_W: Optional[np.ndarray] = None
         self.prev_gyro_I: Optional[np.ndarray] = None
+        self.external_force_body = np.zeros(3, dtype=float)
+        self.external_moment_body = np.zeros(3, dtype=float)
+        self.last_external_wrench_cmd_wall_t: Optional[float] = None
 
         # -------- ROS I/O --------
         self.sub_input = self.create_subscription(Input, "/minitrone/input", self.on_input, 10)
+        self.sub_external_wrench = self.create_subscription(
+            Wrench, "/minitrone/external_wrench_cmd", self.on_external_wrench, 10
+        )
         self.pub_state = self.create_publisher(MinitroneState, "/minitrone/state", 10)
+        self.pub_mob_observer_input = self.create_publisher(
+            MobObserverInput, "/minitrone/mob_observer_input", 10
+        )
 
         self._lock = threading.Lock()
         self._stop = False
@@ -141,6 +163,12 @@ class PlantRosNode(Node):
         with self._lock:
             self.ctrl_recv = u[:8].copy()
 
+    def on_external_wrench(self, msg: Wrench):
+        with self._lock:
+            self.external_force_body[:] = np.asarray(msg.force, dtype=float)
+            self.external_moment_body[:] = np.asarray(msg.moment, dtype=float)
+            self.last_external_wrench_cmd_wall_t = time.perf_counter()
+
     def _sensing(self, sid: int) -> np.ndarray:
         adr = self.s_adr[sid]
         dim = self.s_dim[sid]
@@ -153,6 +181,42 @@ class PlantRosNode(Node):
         self._delay_buf[self._delay_idx] = self.ctrl_recv
         self._delay_idx = (self._delay_idx + 1) % self._delay_len
         return self._delay_buf[self._delay_idx]
+
+    def _actuation_wrench_body(self):
+        base_pos_W = np.asarray(self.data.xpos[self.base_body_id], dtype=float)
+        R_WB = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
+        force_W = np.zeros(3, dtype=float)
+        moment_W = np.zeros(3, dtype=float)
+
+        for actuator_id, site_id in zip(self.aid_prop, self.prop_site_id):
+            actuator_force = float(self.data.actuator_force[actuator_id])
+            gear = np.asarray(self.model.actuator_gear[actuator_id], dtype=float)
+            R_WS = np.asarray(self.data.site_xmat[site_id], dtype=float).reshape(3, 3)
+            site_pos_W = np.asarray(self.data.site_xpos[site_id], dtype=float)
+
+            prop_force_W = R_WS @ (gear[:3] * actuator_force)
+            prop_moment_W = (
+                np.cross(site_pos_W - base_pos_W, prop_force_W)
+                + R_WS @ (gear[3:6] * actuator_force)
+            )
+            force_W += prop_force_W
+            moment_W += prop_moment_W
+
+        return R_WB.T @ force_W, R_WB.T @ moment_W
+
+    def _apply_external_wrench(self):
+        if (
+            self.last_external_wrench_cmd_wall_t is not None
+            and time.perf_counter() - self.last_external_wrench_cmd_wall_t
+            > EXTERNAL_WRENCH_CMD_TIMEOUT
+        ):
+            self.external_force_body[:] = 0.0
+            self.external_moment_body[:] = 0.0
+
+        R_WB = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
+        self.data.xfrc_applied[self.base_body_id, :] = 0.0
+        self.data.xfrc_applied[self.base_body_id, 0:3] = R_WB @ self.external_force_body
+        self.data.xfrc_applied[self.base_body_id, 3:6] = R_WB @ self.external_moment_body
 
     # -------- Simulation loop --------
     def sim_loop(self):
@@ -175,6 +239,8 @@ class PlantRosNode(Node):
                 # ---- servos: ctrl = desired angle (rad) ----
                 for i in range(4):
                     self.data.ctrl[self.aid_servo[i]] = float(u[4 + i])
+
+                self._apply_external_wrench()
 
                 # ---- step physics ----
                 while now >= next_step:
@@ -228,6 +294,18 @@ class PlantRosNode(Node):
                     msg.servo = (servo * RAD2DEG).tolist()
 
                     self.pub_state.publish(msg)
+
+                    actuation_force_B, actuation_moment_B = self._actuation_wrench_body()
+                    mob_msg = MobObserverInput()
+                    mob_msg.step = int(round(float(self.data.time) * PHYSICS_HZ))
+                    mob_msg.sim_time = float(self.data.time)
+                    mob_msg.pos = pos_W.tolist()
+                    mob_msg.vel = vel_W.tolist()
+                    mob_msg.rpy = rpy.tolist()
+                    mob_msg.w_rpy = gyro_I.tolist()
+                    mob_msg.actuation_force = actuation_force_B.astype(np.float32).tolist()
+                    mob_msg.actuation_moment = actuation_moment_B.astype(np.float32).tolist()
+                    self.pub_mob_observer_input.publish(mob_msg)
                     next_pub += 1.0 / PHYSICS_HZ
 
             sleep_t = next_step - time.perf_counter()

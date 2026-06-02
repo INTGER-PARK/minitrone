@@ -42,12 +42,12 @@ def generate_launch_description():
         name="minitrone_allocator_controller",
         output="screen"
     )
-
-    ekf_state_estimator = Node(
-        package="minitrone_controller",
-        executable="minitrone_ekf_state_estimator",
-        name="minitrone_ekf_state_estimator",
-        output="screen"
+    
+    second_mob = Node(
+    package="minitrone_controller",
+    executable="minitrone_second_wrench_observer",
+    name="mminitrone_second_wrench_observer",
+    output="screen"
     )
 
     start_controllers_after_plant = RegisterEventHandler(
@@ -57,7 +57,7 @@ def generate_launch_description():
             # Start it manually when needed:
             #   ros2 run minitrone_controller minitrone_first_wrench_observer
             # It publishes /minitrone/external_wrench_hat for monitoring only.
-            on_start=[wrench_controller, allocator_controller, ekf_state_estimator]
+            on_start=[wrench_controller, allocator_controller, second_mob ]
         )
     )
 

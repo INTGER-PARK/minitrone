@@ -13,7 +13,7 @@
 
 namespace
 {
-// 2 * Pi 값 정의. 사인파(Sine wave)의 각속도 계산을 위해 사용됩니다.
+// 2 * Pi 값 정의. 사인파(Sine wave)의 각속도 계산을 위해 사용.
 constexpr double kTwoPi = 6.28318530717958647692;
 }
 

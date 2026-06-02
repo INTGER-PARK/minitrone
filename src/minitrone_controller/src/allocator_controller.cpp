@@ -16,17 +16,18 @@ public:
   static constexpr size_t buffer_size = 10;
   static constexpr double deg_to_rad  = M_PI / 180.0;
 
-  static constexpr double lpf_alpha = 0.01;   // LPF for tauz bias
   static constexpr double zeta = 0.02;        // reaction torque coefficient
   static constexpr double k_thrust = 0.02;    // thrust coefficient in thrust = k_thrust * w^2
-  static constexpr double r = 0.120913386; 
-  static constexpr double l_arm = sqrt(2)*r;
-  static constexpr double r_z = 0.102968599;    // prop site z relative to body CoM
+  static constexpr double arm_xy = 0.120913386; 
+  static constexpr double arm_r = sqrt(2)*arm_xy;
+  static constexpr double r_z = 0.126394928;    // prop site z relative to body CoM
   
   static constexpr double max_motor_thrust = 15;
   static constexpr double max_motor_speed = std::sqrt(max_motor_thrust / k_thrust);
   
-
+  static constexpr double tauz_lpf_cutoff_rad_s = 5; // Yaw torque LPF cutoff angular frequency
+  static constexpr double yaw_trim_limit = 2.0 * zeta * max_motor_thrust;// Motor reaction torque로 처리 가능한 yaw trim 한계
+  
   static constexpr double servo_limit_rad = 1.0472;
   static constexpr double servo_limit_sin = std::sin(servo_limit_rad);
 
@@ -68,11 +69,26 @@ private:
     Eigen::Matrix<double,6,1> Wrench;
     Wrench << static_cast<double>(msg->moment[0]), static_cast<double>(msg->moment[1]), static_cast<double>(msg->moment[2]),
                static_cast<double>(msg->force[0]),  static_cast<double>(msg->force[1]),  static_cast<double>(msg->force[2]);
+    // Desired yaw torque [Nm]
+    double tauz_des = Wrench(2);
 
-    tauz_bar_ = lpf_alpha * Wrench(2) + (1.0 - lpf_alpha) * tauz_bar_;
-    double tauz_r     = Wrench(2) - tauz_bar_;
-    double tauz_r_sat = std::clamp(tauz_r, -2.0, 2.0); // yaw reaction torque limit [Nm]
-    double tauz_t     = tauz_bar_ + (tauz_r - tauz_r_sat);
+    // First-order LPF coefficient from cutoff angular frequency [rad/s]
+    // alpha = 1 - exp(-wc * dt)
+    const double alpha_tauz = 1.0 - std::exp(-tauz_lpf_cutoff_rad_s * dt);
+
+    // Low-frequency yaw torque component
+    // 느린 yaw torque 성분은 servo tilt allocation 쪽으로 보냄
+    tauz_bar_ += alpha_tauz * (tauz_des - tauz_bar_);
+
+    // High-frequency residual yaw torque
+    // 빠른 yaw torque 성분은 motor reaction torque trim으로 처리
+    double tauz_r = tauz_des - tauz_bar_;
+
+    // Saturate yaw trimming authority
+    double tauz_r_sat = std::clamp(tauz_r, -yaw_trim_limit, yaw_trim_limit);
+
+    // Remaining yaw torque goes to tilt-based allocation
+    double tauz_t = tauz_bar_ + (tauz_r - tauz_r_sat);
 
     const Eigen::Vector4d B1(Wrench(0), Wrench(1), tauz_r_sat, Wrench(5));
     const Eigen::Vector4d B2(Wrench(3), Wrench(4), tauz_t, 0.0);
@@ -201,15 +217,15 @@ private:
 
     double pcx = Pc_(0), pcy = Pc_(1), pcz = Pc_(2);
 
-    A1(0,0) = inv_sqrt2 * ( zeta +  r_z - pcz) * s1 + ( +l_arm/sqrt(2) - pcy) * c1; //
-    A1(0,1) = inv_sqrt2 * (-zeta -  r_z + pcz) * s2 + ( +l_arm/sqrt(2) - pcy) * c2;
-    A1(0,2) = inv_sqrt2 * (-zeta -  r_z + pcz) * s3 + ( -l_arm/sqrt(2) - pcy) * c3;
-    A1(0,3) = inv_sqrt2 * ( zeta +  r_z - pcz) * s4 + ( -l_arm/sqrt(2) - pcy) * c4;
+    A1(0,0) = inv_sqrt2 * ( zeta +  r_z - pcz) * s1 + ( +arm_r/sqrt(2) - pcy) * c1; //
+    A1(0,1) = inv_sqrt2 * (-zeta -  r_z + pcz) * s2 + ( +arm_r/sqrt(2) - pcy) * c2;
+    A1(0,2) = inv_sqrt2 * (-zeta -  r_z + pcz) * s3 + ( -arm_r/sqrt(2) - pcy) * c3;
+    A1(0,3) = inv_sqrt2 * ( zeta +  r_z - pcz) * s4 + ( -arm_r/sqrt(2) - pcy) * c4;
 
-    A1(1,0) = inv_sqrt2 * (-zeta +  r_z - pcz) * s1 + ( -l_arm/sqrt(2) + pcx) * c1;
-    A1(1,1) = inv_sqrt2 * (-zeta +  r_z - pcz) * s2 + ( +l_arm/sqrt(2) + pcx) * c2;
-    A1(1,2) = inv_sqrt2 * ( zeta -  r_z + pcz) * s3 + ( +l_arm/sqrt(2) + pcx) * c3;
-    A1(1,3) = inv_sqrt2 * ( zeta -  r_z + pcz) * s4 + ( -l_arm/sqrt(2) + pcx) * c4;
+    A1(1,0) = inv_sqrt2 * (-zeta +  r_z - pcz) * s1 + ( -arm_r/sqrt(2) + pcx) * c1;
+    A1(1,1) = inv_sqrt2 * (-zeta +  r_z - pcz) * s2 + ( +arm_r/sqrt(2) + pcx) * c2;
+    A1(1,2) = inv_sqrt2 * ( zeta -  r_z + pcz) * s3 + ( +arm_r/sqrt(2) + pcx) * c3;
+    A1(1,3) = inv_sqrt2 * ( zeta -  r_z + pcz) * s4 + ( -arm_r/sqrt(2) + pcx) * c4;
 
     A1(2,0) =  zeta * c1;
     A1(2,1) = -zeta * c2;
@@ -244,15 +260,15 @@ private:
     A2(1,2) =  inv_sqrt2 * f3;
     A2(1,3) = -inv_sqrt2 * f4;
 
-    A2(2,0) = inv_sqrt2 * ( +pcx + pcy) * s1 + (-(+l_arm) ) * f1;
-    A2(2,1) = inv_sqrt2 * ( -pcx + pcy) * s2 + (-(+l_arm) ) * f2;
-    A2(2,2) = inv_sqrt2 * ( -pcx - pcy) * s3 + ((-l_arm) ) * f3;
-    A2(2,3) = inv_sqrt2 * ( +pcx - pcy) * s4 + ((-l_arm)) * f4;
+    A2(2,0) = inv_sqrt2 * ( +pcx + pcy) * s1 + (-(+arm_r) ) * f1;
+    A2(2,1) = inv_sqrt2 * ( -pcx + pcy) * s2 + (-(+arm_r) ) * f2;
+    A2(2,2) = inv_sqrt2 * ( -pcx - pcy) * s3 + ((-arm_r) ) * f3;
+    A2(2,3) = inv_sqrt2 * ( +pcx - pcy) * s4 + ((-arm_r)) * f4;
 
-    A2(3,0) = +1 * ( -(+l_arm) - (+l_arm) ) * f1;
-    A2(3,1) = -1* ( +(-l_arm) - (+l_arm) ) * f2;
-    A2(3,2) = +1 * ( +(-l_arm) + (-l_arm) ) * f3;
-    A2(3,3) = -1 * ( -(+l_arm) + (-l_arm) ) * f4;
+    A2(3,0) = +1 * ( -(+arm_r) - (+arm_r) ) * f1;
+    A2(3,1) = -1* ( +(-arm_r) - (+arm_r) ) * f2;
+    A2(3,2) = +1 * ( +(-arm_r) + (-arm_r) ) * f3;
+    A2(3,3) = -1 * ( -(+arm_r) + (-arm_r) ) * f4;
 
     return A2;
   }

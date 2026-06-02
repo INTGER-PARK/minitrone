@@ -85,35 +85,35 @@
              1: +x +y, 2: -x +y, 3: -x -y, 4: +x -y.
            Propeller disks are visual/non-collision cylinders copied from the crosstrone style
            and placed at each X-frame propeller site. -->
-      <body name="servo1" pos="0.120913386 0.120913386 0.131765459" quat="0.9238795 0 0 0.3826834">
+      <body name="servo1" pos="0.120913386 0.120913386 0.126394928" quat="0.9238795 0 0 0.3826834">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
-        <joint name="j_servo1" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 -0.028796860" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop1_body" pos="0.000000000 0.000000000 -0.028796860">
+        <joint name="j_servo1" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
+        <body name="prop1_body" pos="0.000000000 0.000000000 0.000000000">
           <geom name="prop1_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="1" />
           <site name="prop1_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo2" pos="-0.120913386 0.120913386 0.131765459" quat="0.3826834 0 0 0.9238795">
+      <body name="servo2" pos="-0.120913386 0.120913386 0.126394928" quat="0.3826834 0 0 0.9238795">
         <!-- Tiny dummy inertia for MuJoCo compile stability; not intended as physical mass. -->
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
-        <joint name="j_servo2" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 -0.028796860" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop2_body" pos="0.000000000 0.000000000 -0.028796860">
+        <joint name="j_servo2" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
+        <body name="prop2_body" pos="0.000000000 0.000000000 -0.000000000">
           <geom name="prop2_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="2" />
           <site name="prop2_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo3" pos="-0.120913386 -0.120913386 0.131765459" quat="0.3826834 0 0 -0.9238795">
+      <body name="servo3" pos="-0.120913386 -0.120913386 0.126394928" quat="0.3826834 0 0 -0.9238795">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
-        <joint name="j_servo3" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 -0.028796860" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop3_body" pos="0.000000000 0.000000000 -0.028796860">
+        <joint name="j_servo3" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
+        <body name="prop3_body" pos="0.000000000 0.000000000 -0.000000000">
           <geom name="prop3_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="3" />
           <site name="prop3_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo4" pos="0.120913386 -0.120913386 0.131765459" quat="0.9238795 0 0 -0.3826834">
+      <body name="servo4" pos="0.120913386 -0.120913386 0.126394928" quat="0.9238795 0 0 -0.3826834">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
-        <joint name="j_servo4" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 -0.028796860" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop4_body" pos="0.000000000 0.000000000 -0.028796860">
+        <joint name="j_servo4" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
+        <body name="prop4_body" pos="0.000000000 0.000000000 0.000000000">
           <geom name="prop4_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="4" />
           <site name="prop4_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>

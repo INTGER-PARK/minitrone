@@ -17,20 +17,20 @@ public:
   WrenchController() : rclcpp::Node("minitrone_wrench_controller")
   {
     // ===================== (MINITRONE) params =====================
-    // minitrone_400x400x300_armature.xml inertial mass.
+    // 
     this->declare_parameter<double>("mass", 2.5);
     this->declare_parameter<double>("gravity", 9.81);
     mass_ = this->get_parameter("mass").as_double();
     grav_ = this->get_parameter("gravity").as_double();
 
     // ===================== gains (기존 유지) =====================
-    const double KP_POS[3] = {28.0, 28.0, 20.0};
-    const double KI_POS[3] = {1.5, 1.5, 1.1};
+    const double KP_POS[3] = {28.0, 28.0, 24.0};
+    const double KI_POS[3] = {1.5, 1.5, 1.2};
     const double KD_POS[3] = {6.0, 6.0, 10.0};
     const double I_MIN_POS = -5.0, I_MAX_POS = 100.0, OUT_MIN_POS = -200.0, OUT_MAX_POS = 200.0;
 
-    const double KP_ATT[3] = {3.00, 3.00, 3.00};
-    const double KI_ATT[3] = {0.01, 0.01, 0.01};
+    const double KP_ATT[3] = {6.00, 6.00, 6.00};
+    const double KI_ATT[3] = {0.02, 0.02, 0.02};
     const double KD_ATT[3] = {0.80, 0.80, 0.80};
     const double I_MIN_ATT = -1.0, I_MAX_ATT = 1.0, OUT_MIN_ATT = -5.0, OUT_MAX_ATT = 5.0;
 
