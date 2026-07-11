@@ -4,3 +4,6 @@ ERROR: could not initialize GLFW
 Wed Jun  3 03:37:42 2026
 WARNING: Nan, Inf or huge value in QACC at DOF 3. The simulation is unstable. Time = 10.6825.
 
+Wed Jun 17 02:15:55 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+

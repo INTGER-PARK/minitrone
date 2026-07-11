@@ -48,7 +48,7 @@ public:
 
     // Rigid-body mass used for linear momentum p_W = m v_W.
     // Unit: kg.
-    mass_ = this->declare_parameter<double>("mass", 4.0);
+    mass_ = this->declare_parameter<double>("mass", 2.5);
     // Gravity acceleration magnitude. gravity_world = [0, 0, -m*g].
     // Unit: m/s^2.
     gravity_ = this->declare_parameter<double>("gravity", 9.81);

@@ -44,20 +44,19 @@ def generate_launch_description():
     )
     
     second_mob = Node(
-    package="minitrone_controller",
-    executable="minitrone_second_wrench_observer",
-    name="mminitrone_second_wrench_observer",
-    output="screen"
+        package="minitrone_controller",
+        executable="minitrone_second_wrench_observer",
+        name="minitrone_second_wrench_observer",
+        output="screen"
     )
 
     start_controllers_after_plant = RegisterEventHandler(
         OnProcessStart(
             target_action=plant,
-            # MoB/wrench_observer is intentionally not launched here.
-            # Start it manually when needed:
-            #   ros2 run minitrone_controller minitrone_first_wrench_observer
-            # It publishes /minitrone/external_wrench_hat for monitoring only.
-            on_start=[wrench_controller, allocator_controller, second_mob ]
+            # Normal: cmd/att_cmd -> wrench controller -> allocator.
+            # Optional impedance override uses second-order MoB output and is
+            # toggled from minitrone_impedance_controller in a terminal.
+            on_start=[second_mob, wrench_controller, allocator_controller]
         )
     )
 

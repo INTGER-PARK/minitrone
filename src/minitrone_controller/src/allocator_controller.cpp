@@ -3,6 +3,7 @@
 #include <minitrone_interfaces/msg/input.hpp>
 #include <minitrone_interfaces/msg/minitrone_state.hpp>
 
+#include <limits>
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
@@ -25,11 +26,12 @@ public:
   static constexpr double max_motor_thrust = 15;
   static constexpr double max_motor_speed = std::sqrt(max_motor_thrust / k_thrust);
   
-  static constexpr double tauz_lpf_cutoff_rad_s = 5; // Yaw torque LPF cutoff angular frequency
+  static constexpr double tauz_lpf_cutoff_rad_s = 1; // Yaw torque LPF cutoff angular frequency
   static constexpr double yaw_trim_limit = 2.0 * zeta * max_motor_thrust;// Motor reaction torque로 처리 가능한 yaw trim 한계
   
-  static constexpr double servo_limit_rad = 1.0472;
-  static constexpr double servo_limit_sin = std::sin(servo_limit_rad);
+  static constexpr double servo_limit_degree = 65.0; //max=65.4, 0.5max = 32.7
+  static constexpr double servo_limit_rad = servo_limit_degree * deg_to_rad; //1.0472;
+ static inline const double servo_limit_sin = std::sin(servo_limit_rad);
 
   AllocatorController() : rclcpp::Node("minitrone_allocator_controller")
   {
@@ -41,7 +43,7 @@ public:
     dt_buffer_.assign(buffer_size, 0.01);
     dt_sum_ = 0.01 * static_cast<double>(buffer_size);
 
-    Pc_.setZero();
+    Pc_ << 0.0, 0.0, r_z; //Pc_.setZero();
   }
 
 private:
@@ -93,16 +95,46 @@ private:
     const Eigen::Vector4d B1(Wrench(0), Wrench(1), tauz_r_sat, Wrench(5));
     const Eigen::Vector4d B2(Wrench(3), Wrench(4), tauz_t, 0.0);
 
+    // ----------------------------------------------------
+    // Step 1: 현재 측정된 servo angle에서 preliminary thrust 계산
+    // ----------------------------------------------------
     Eigen::Matrix4d A1_mea = calc_A1(C2_mea_);
     Eigen::Vector4d C1_raw = solve4x4(A1_mea, B1);
-    Eigen::Matrix4d A2 = calc_A2(C1_raw, C2_mea_);
+    // A2 계산에는 물리적으로 가능한 thrust만 사용
+    Eigen::Vector4d C1_seed =
+      C1_raw
+        .cwiseMax(0.0)
+        .cwiseMin(max_motor_thrust);
+
+    // ----------------------------------------------------
+    // Step 2: 횡력과 tilt yaw를 위한 servo allocation
+    // ----------------------------------------------------
+    Eigen::Matrix4d A2 = calc_A2(C1_seed, C2_mea_);
+
     Eigen::Vector4d S_des = solve4x4(A2, B2);
+
     C2_des_ = sinToServoAngle(S_des);
 
-    Eigen::Vector4d S_cmd = S_des.cwiseMax(-servo_limit_sin).cwiseMin(servo_limit_sin);
-    Eigen::Vector4d C2_cmd = sinToServoAngle(S_cmd).cwiseMax(-servo_limit_rad).cwiseMin(servo_limit_rad);
+    Eigen::Vector4d S_cmd =
+      S_des
+        .cwiseMax(-servo_limit_sin)
+        .cwiseMin(servo_limit_sin);
+
+    Eigen::Vector4d C2_cmd =
+      sinToServoAngle(S_cmd)
+        .cwiseMax(-servo_limit_rad)
+        .cwiseMin(servo_limit_rad);
+
+    // ----------------------------------------------------
+    // Step 3: 결정된 servo angle에서 최종 motor thrust 재계산
+    // ----------------------------------------------------
     Eigen::Matrix4d A1_cmd = calc_A1(C2_cmd);
-    C1_ = solve4x4(A1_cmd, B1).cwiseMax(0.0).cwiseMin(max_motor_thrust);
+
+    Eigen::Vector4d C1_final_raw = solve4x4(A1_cmd, B1);
+
+    C1_ = C1_final_raw
+        .cwiseMax(0.0)
+        .cwiseMin(max_motor_thrust);
 
     minitrone_interfaces::msg::Input out;
 

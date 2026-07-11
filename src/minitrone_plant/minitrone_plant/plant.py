@@ -11,6 +11,7 @@ import mujoco
 import mujoco.viewer
 
 from minitrone_interfaces.msg import Input, MinitroneState, MobObserverInput, Wrench
+from std_msgs.msg import Float64MultiArray
 
 PHYSICS_HZ = 400.0
 ZETA = 0.02          # thrust = ZETA * omega^2  (minitrone allocator/plant convention)
@@ -44,6 +45,19 @@ def rpy_to_R_WB(rpy: np.ndarray) -> np.ndarray:
         [ cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
         [ sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
         [   -sp,             cp*sr,             cp*cr]
+    ], dtype=float)
+
+
+def rpy_to_quat_wxyz(rpy: np.ndarray) -> np.ndarray:
+    r, p, y = float(rpy[0]), float(rpy[1]), float(rpy[2])
+    cr, sr = math.cos(0.5 * r), math.sin(0.5 * r)
+    cp, sp = math.cos(0.5 * p), math.sin(0.5 * p)
+    cy, sy = math.cos(0.5 * y), math.sin(0.5 * y)
+    return np.array([
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
     ], dtype=float)
 
 
@@ -118,6 +132,18 @@ class PlantRosNode(Node):
             siteid("prop4_site"),
         ]
 
+        self.palm_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand_palm")
+        self.palm_mocap_id = -1
+        if self.palm_body_id >= 0:
+            self.palm_mocap_id = int(self.model.body_mocapid[self.palm_body_id])
+            if self.palm_mocap_id >= 0:
+                self.data.mocap_pos[self.palm_mocap_id] = self.model.body_pos[self.palm_body_id]
+                self.data.mocap_quat[self.palm_mocap_id] = self.model.body_quat[self.palm_body_id]
+            else:
+                self.get_logger().warn("Body 'hand_palm' exists but is not a mocap body")
+        else:
+            self.get_logger().warn("Body 'hand_palm' not found; palm teleop disabled")
+
         self.s_adr = self.model.sensor_adr
         self.s_dim = self.model.sensor_dim
 
@@ -144,6 +170,13 @@ class PlantRosNode(Node):
         self.pub_mob_observer_input = self.create_publisher(
             MobObserverInput, "/minitrone/mob_observer_input", 10
         )
+        self.pub_actuation_wrench_body = self.create_publisher(
+            Wrench, "/minitrone/actuation_wrench_body", 10
+        )
+        self.sub_palm_pose = self.create_subscription(
+            Float64MultiArray, "/minitrone/palm_pose_cmd", self.on_palm_pose_cmd, 10
+        )
+        self.pub_palm_pose = self.create_publisher(Float64MultiArray, "/minitrone/palm_pose_state", 10)
 
         self._lock = threading.Lock()
         self._stop = False
@@ -169,6 +202,15 @@ class PlantRosNode(Node):
             self.external_moment_body[:] = np.asarray(msg.moment, dtype=float)
             self.last_external_wrench_cmd_wall_t = time.perf_counter()
 
+    def on_palm_pose_cmd(self, msg: Float64MultiArray):
+        if self.palm_mocap_id < 0 or len(msg.data) < 6:
+            return
+        pos = np.array(msg.data[:3], dtype=float)
+        quat = rpy_to_quat_wxyz(np.array(msg.data[3:6], dtype=float))
+        with self._lock:
+            self.data.mocap_pos[self.palm_mocap_id] = pos
+            self.data.mocap_quat[self.palm_mocap_id] = quat
+
     def _sensing(self, sid: int) -> np.ndarray:
         adr = self.s_adr[sid]
         dim = self.s_dim[sid]
@@ -176,6 +218,15 @@ class PlantRosNode(Node):
 
     def _noisy(self, x: np.ndarray, sigma: float) -> np.ndarray:
         return x + np.random.normal(0.0, sigma, size=x.shape)
+
+    def _publish_palm_pose(self):
+        if self.palm_mocap_id < 0:
+            return
+        quat = np.array(self.data.mocap_quat[self.palm_mocap_id], dtype=float)
+        rpy = quat_to_rpy(quat)
+        msg = Float64MultiArray()
+        msg.data = np.concatenate((self.data.mocap_pos[self.palm_mocap_id], rpy)).tolist()
+        self.pub_palm_pose.publish(msg)
 
     def _delay_step(self) -> np.ndarray:
         self._delay_buf[self._delay_idx] = self.ctrl_recv
@@ -306,6 +357,12 @@ class PlantRosNode(Node):
                     mob_msg.actuation_force = actuation_force_B.astype(np.float32).tolist()
                     mob_msg.actuation_moment = actuation_moment_B.astype(np.float32).tolist()
                     self.pub_mob_observer_input.publish(mob_msg)
+
+                    actuation_wrench_msg = Wrench()
+                    actuation_wrench_msg.force = actuation_force_B.astype(np.float32).tolist()
+                    actuation_wrench_msg.moment = actuation_moment_B.astype(np.float32).tolist()
+                    self.pub_actuation_wrench_body.publish(actuation_wrench_msg)
+                    self._publish_palm_pose()
                     next_pub += 1.0 / PHYSICS_HZ
 
             sleep_t = next_step - time.perf_counter()

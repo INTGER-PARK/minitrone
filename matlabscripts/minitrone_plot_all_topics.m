@@ -20,11 +20,13 @@ external_force_ylim = [-0.3, 0.3];
 enable_external_force_ytick = false;
 external_force_ytick_step = 0.1;
 
+impedance_n_face_body = [1, 0, 0];
+
 %========================================================%
 % Read CSV
 
     script_dir = fileparts(mfilename("fullpath"));
-    csv_path = fullfile(script_dir, "..", "csv_out", "bag_all_20260603_033758.csv");
+    csv_path = fullfile(script_dir, "..", "csv_out", "bag_all_20260619_125206.csv");
 
 
 assert(isfile(csv_path), "Missing CSV file: %s", csv_path);
@@ -46,11 +48,13 @@ cmd = topic_table(all_topics, "/minitrone/cmd");
 att = topic_table(all_topics, "/minitrone/att_cmd");
 wrench_cmd = topic_table(all_topics, "/minitrone/wrench_cmd");
 input_cmd = topic_table(all_topics, "/minitrone/input");
+actuation_wrench_body = topic_table(all_topics, "/minitrone/actuation_wrench_body");
 actuation_force_body = topic_table(all_topics, "/minitrone/actuation_force_body");
 mob_observer_input = topic_table(all_topics, "/minitrone/mob_observer_input");
 wrench_hat = topic_table(all_topics, "/minitrone/external_wrench_hat");
 wrench_hat_second = topic_table(all_topics, "/minitrone/external_wrench_hat_second_order");
 external_wrench_cmd = topic_table(all_topics, "/minitrone/external_wrench_cmd");
+impedance_des_force_topic = topic_table(all_topics, "/minitrone/impedance_des_force");
 
 t0 = choose_t0(state, all_topics);
 
@@ -126,8 +130,8 @@ if has_rows(state) && has_rows(input_cmd)
         subplot(4, 1, k);
         plot(ti, servo_cmd{k}, "b--", "LineWidth", 2.0, "DisplayName", "cmd"); hold on;
         plot(ts, servo_real{k}, "r-", "LineWidth", 2.0, "DisplayName", "real");
-        yline(60, "k--", "LineWidth", 1.5, "DisplayName", "limit");
-        yline(-60, "k--", "LineWidth", 1.5, "HandleVisibility", "off");
+        yline(64.0, "k--", "LineWidth", 1.5, "DisplayName", "limit");
+        yline(-64.0, "k--", "LineWidth", 1.5, "HandleVisibility", "off");
         grid on; xlabel("time [s]", "FontSize", 15, "FontWeight", "bold");
         ylabel("servo" + string(k) + " [deg]", "FontSize", 15, "FontWeight", "bold");
         legend("Location", "northeast");
@@ -165,6 +169,34 @@ if has_rows(input_cmd)
 end
 
 %========================================================%
+% BLDC Thrust Command
+%========================================================%
+if has_rows(input_cmd)
+    ti = input_cmd.t_sec - t0;
+    k_thrust = 0.02;
+    thrust_cmd = cell(1, 4);
+    for k = 1:4
+        omega = col(input_cmd, "input__u_" + string(k - 1), "u_" + string(k - 1));
+        thrust_cmd{k} = k_thrust * max(omega, 0).^2;
+    end
+
+    figure("Name", "BLDC Thrust Command", "Color", "w");
+    sgtitle("BLDC Thrust Command", "FontSize", 15, "FontWeight", "bold");
+    for k = 1:4
+        subplot(4, 1, k);
+        plot(ti, thrust_cmd{k}, "b-", "LineWidth", 2.0);
+        yline(15, "k--", "LineWidth", 1.5, "DisplayName", "limit");
+        grid on;
+        xlabel("time [s]", "FontSize", 15, "FontWeight", "bold");
+        ylabel("T" + string(k) + " [N]", "FontSize", 15, "FontWeight", "bold");
+        legend("Location", "northeast");
+    end
+    finalize_figure(gcf, enable_plot_xlim, plot_xlim, enable_plot_xtick, plot_xtick_step, enable_sync_x);
+else
+    warning("Skipping BLDC Thrust plot because /minitrone/input is missing.");
+end
+
+%========================================================%
 % Controller Wrench Command
 %========================================================%
 if has_rows(wrench_cmd)
@@ -180,9 +212,77 @@ else
 end
 
 %========================================================%
-% Actual Actuation Body Force
+% Normal Force
 %========================================================%
-if has_rows(actuation_force_body)
+if has_rows(wrench_hat_second)
+    th = wrench_hat_second.t_sec - t0;
+    [~, Fhat_imp] = wrench_columns(wrench_hat_second, "external_wrench_hat_second_order");
+
+    n_face_body = impedance_n_face_body(:);
+    if norm(n_face_body) < 1e-9
+        n_face_body = [1; 0; 0];
+    end
+    n_face_body = n_face_body / norm(n_face_body);
+
+    f_hat_normal = max(0, -(n_face_body(1) * Fhat_imp{1} + ...
+                            n_face_body(2) * Fhat_imp{2} + ...
+                            n_face_body(3) * Fhat_imp{3}));
+
+    if has_rows(impedance_des_force_topic)
+        td = impedance_des_force_topic.t_sec - t0;
+        f_des = col(impedance_des_force_topic, "impedance_des_force__data", "data");
+        f_des_normal = previous_interp(td, f_des, th);
+        has_f_des_normal = true;
+    else
+        has_f_des_normal = false;
+        warning("No /minitrone/impedance_des_force topic; skipping F_des in Normal Force plot.");
+    end
+
+    has_act_normal = has_rows(actuation_wrench_body);
+    if has_act_normal
+        ta = actuation_wrench_body.t_sec - t0;
+        [~, Fact_imp] = wrench_columns(actuation_wrench_body, "actuation_wrench_body");
+        f_act_normal = n_face_body(1) * Fact_imp{1} + ...
+                       n_face_body(2) * Fact_imp{2} + ...
+                       n_face_body(3) * Fact_imp{3};
+    end
+
+    figure("Name", "Normal Force", "Color", "w");
+    sgtitle("Normal Force", ...
+        "FontSize", 15, "FontWeight", "bold");
+    if has_f_des_normal
+        plot(th, f_des_normal, "b--", "LineWidth", 2.0, ...
+            "DisplayName", "F_{des}"); hold on;
+    else
+        hold on;
+    end
+    plot(th, f_hat_normal, "r--", "LineWidth", 2.0, ...
+        "DisplayName", "\F_hat");
+    if has_act_normal
+        plot(ta, f_act_normal, "m-", "LineWidth", 1.5, ...
+            "DisplayName", "F_{N_{lpf}}");
+    end
+    grid on;
+    xlabel("time [s]", "FontSize", 15, "FontWeight", "bold");
+    ylabel("normal force [N]", "FontSize", 15, "FontWeight", "bold");
+    legend("Location", "northeast");
+    finalize_figure(gcf, enable_plot_xlim, plot_xlim, enable_plot_xtick, plot_xtick_step, enable_sync_x);
+else
+    warning("Skipping Normal Force plot because /minitrone/external_wrench_hat_second_order is missing.");
+end
+
+%========================================================%
+% Actual Actuation Body Wrench
+%========================================================%
+if has_rows(actuation_wrench_body)
+    tf = actuation_wrench_body.t_sec - t0;
+    [M, F] = wrench_columns(actuation_wrench_body, "actuation_wrench_body");
+
+    figure("Name", "Actual Actuation Body Wrench", "Color", "w");
+    sgtitle("Actual Actuation Body Wrench", "FontSize", 15, "FontWeight", "bold");
+    plot_wrench_grid(tf, M, F, "r-");
+    finalize_figure(gcf, enable_plot_xlim, plot_xlim, enable_plot_xtick, plot_xtick_step, enable_sync_x);
+elseif has_rows(actuation_force_body)
     tf = actuation_force_body.t_sec - t0;
     Fx = col(actuation_force_body, ["body_force__force_0", "actuation_force_body__force_0"], "force_0");
     Fy = col(actuation_force_body, ["body_force__force_1", "actuation_force_body__force_1"], "force_1");
@@ -194,16 +294,19 @@ if has_rows(actuation_force_body)
     finalize_figure(gcf, enable_plot_xlim, plot_xlim, enable_plot_xtick, plot_xtick_step, enable_sync_x);
 elseif has_rows(mob_observer_input)
     tf = mob_observer_input.t_sec - t0;
+    Mx = col(mob_observer_input, "mob_observer_input__actuation_moment_0", "actuation_moment_0");
+    My = col(mob_observer_input, "mob_observer_input__actuation_moment_1", "actuation_moment_1");
+    Mz = col(mob_observer_input, "mob_observer_input__actuation_moment_2", "actuation_moment_2");
     Fx = col(mob_observer_input, "mob_observer_input__actuation_force_0", "actuation_force_0");
     Fy = col(mob_observer_input, "mob_observer_input__actuation_force_1", "actuation_force_1");
     Fz = col(mob_observer_input, "mob_observer_input__actuation_force_2", "actuation_force_2");
 
-    figure("Name", "Actual Actuation Body Force", "Color", "w");
-    sgtitle("Actual Actuation Body Force", "FontSize", 15, "FontWeight", "bold");
-    plot_scalar_stack(tf, {Fx, Fy, Fz}, ["Fx_B [N]", "Fy_B [N]", "Fz_B [N]"], "r-");
+    figure("Name", "Actual Actuation Body Wrench", "Color", "w");
+    sgtitle("Actual Actuation Body Wrench", "FontSize", 15, "FontWeight", "bold");
+    plot_wrench_grid(tf, {Mx, My, Mz}, {Fx, Fy, Fz}, "r-");
     finalize_figure(gcf, enable_plot_xlim, plot_xlim, enable_plot_xtick, plot_xtick_step, enable_sync_x);
 else
-    warning("Skipping Actual Actuation Body Force plot because force topics are missing.");
+    warning("Skipping Actual Actuation Body Wrench plot because actuation wrench data is missing.");
 end
 %========================================================%
 % External Wrench Cmd Only

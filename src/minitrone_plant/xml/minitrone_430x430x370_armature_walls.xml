@@ -1,14 +1,16 @@
-<mujoco model="minitrone_430x430x370_walls">
+<mujoco model="minitrone_430_square_legs_servo_end_prop_wall_400x380_contact">
   <!--
 
     Modified from minitrone_400x400x350_armature:
       - X-frame configuration is preserved.
       - XY coordinates were resized to target 430 x 430 mm.
       - Z geometry was resized to target 370 mm height.
+      - Four 400 mm square-pipe legs are used, with the X-frame crossing at their center height.
+      - Servo bodies are mounted below the centered X-frame pipes, and propellers are placed at the lower end of each servo.
       - Propeller visual disks are preserved.
       - Servo angle saturation and BLDC saturation are kept matched to crosstrone_450x450x300.
       - Servo bodies are ordered as servo1, servo2, servo3, servo4 in the XML definition.
-      - Four massless collision-only outer wall geoms are added around the 430 x 430 mm envelope.
+      - A single +X perforated contact wall is kept.
 
     Target collision envelope: approximately 0.430 m x 0.430 m x 0.370 m.
 
@@ -30,91 +32,246 @@
     <geom friction="0.8 0.1 0.1" density="0" />
     <joint damping="0.1" stiffness="0" />
   </default>
+
+  <asset>
+    <!-- Lightweight visual materials: all added decorative geoms are visual-only. -->
+    <material name="mat_carbon" rgba="0.025 0.028 0.032 1" specular="0.45" shininess="0.75" />
+    <material name="mat_dark_metal" rgba="0.08 0.085 0.095 1" specular="0.65" shininess="0.85" />
+    <material name="mat_tube" rgba="0.12 0.12 0.13 1" specular="0.35" shininess="0.55" />
+    <material name="mat_motor" rgba="0.04 0.045 0.055 1" specular="0.85" shininess="0.9" />
+    <material name="mat_servo" rgba="0.02 0.10 0.18 1" specular="0.45" shininess="0.55" />
+    <material name="mat_prop" rgba="1.0 0.55 0.08 0.82" specular="0.35" shininess="0.5" />
+    <material name="mat_prop_disc" rgba="1.0 0.55 0.05 0.18" specular="0.2" shininess="0.25" />
+    <material name="mat_contact" rgba="0.10 0.12 0.13 0.70" specular="0.25" shininess="0.45" />
+    <material name="mat_contact_edge" rgba="0.02 0.02 0.025 1" specular="0.35" shininess="0.55" />
+    <material name="mat_battery" rgba="0.12 0.12 0.12 1" specular="0.25" shininess="0.3" />
+    <material name="mat_fc" rgba="0.02 0.25 0.12 1" specular="0.25" shininess="0.45" />
+  </asset>
   <worldbody>
+
+    <!-- Viewer helpers: lights and cameras do not affect dynamics. -->
+    <light name="key_light" pos="1.0 -1.0 1.6" dir="-1 1 -2" diffuse="0.85 0.85 0.85" specular="0.25 0.25 0.25" />
+    <light name="fill_light" pos="-0.8 0.8 1.2" dir="1 -1 -1.5" diffuse="0.25 0.25 0.30" specular="0.05 0.05 0.05" />
+    <camera name="iso_view" pos="0.75 -0.75 0.55" xyaxes="0.707 0.707 0 -0.32 0.32 0.89" />
+    <camera name="front_plate_view" pos="0.75 0.00 0.20" xyaxes="0 1 0 -0.20 0 0.98" />
     <body name="drone_base" pos="0.000000000 0.000000000 0.185000000">
       <freejoint name="root" />
       <!-- All physical mass concentrated at the body-frame origin. -->
-      <inertial pos="0.000000000 0.000000000 0.000000000" mass="2.5" diaginertia="0.0670417 0.0670417 0.0770417" />
+      <inertial pos="0.000000000 0.000000000 0.126394928" mass="2.5" diaginertia="0.0670417 0.0670417 0.0770417" />
       <site name="drone_imu" pos="0.000000000 0.000000000 0.000000000" quat="1 0 0 0" rgba="1 1 1 1" />
 
-      <!-- Massless collision-only outer walls.
-           These four box geoms are attached to drone_base, so they add no independent DOF.
-           mass=0 keeps the walls from changing the vehicle mass/inertia.
-           The outer faces lie on the +/-0.215 m XY envelope of the 430 x 430 mm body.
-           Thickness is 6 mm inward; height spans the 370 mm body height. -->
-      <geom name="outer_wall_px" type="box"
-            pos="0.212000000 0.000000000 0.000000000"
-            size="0.003000000 0.215000000 0.185000000"
-            rgba="0.15 0.15 0.15 0.25"
-            contype="1" conaffinity="1" group="0" mass="0" />
+      <!-- Decorative visual-only central stack. Collision/dynamics remain governed by the existing geoms/inertial. -->
+      <geom name="vis_top_carbon_plate" type="box" pos="0 0 0.010000000"
+            size="0.074 0.074 0.003" material="mat_carbon"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="vis_bottom_carbon_plate" type="box" pos="0 0 -0.010000000"
+            size="0.066 0.066 0.003" material="mat_carbon"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="vis_battery_pack" type="box" pos="0 0 0.034000000"
+            size="0.060 0.035 0.018" material="mat_battery"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="vis_fc_board" type="box" pos="0 0 0.064000000"
+            size="0.040 0.030 0.004" material="mat_fc"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="vis_fc_cover" type="box" pos="0 0 0.072000000"
+            size="0.026 0.020 0.003" rgba="0.02 0.02 0.025 1"
+            contype="0" conaffinity="0" group="1" mass="0" />
 
-      <geom name="outer_wall_nx" type="box"
-            pos="-0.212000000 0.000000000 0.000000000"
-            size="0.003000000 0.215000000 0.185000000"
-            rgba="0.15 0.15 0.15 0.25"
-            contype="1" conaffinity="1" group="0" mass="0" />
 
-      <geom name="outer_wall_py" type="box"
-            pos="0.000000000 0.212000000 0.000000000"
-            size="0.215000000 0.003000000 0.185000000"
-            rgba="0.15 0.15 0.15 0.25"
-            contype="1" conaffinity="1" group="0" mass="0" />
 
-      <geom name="outer_wall_ny" type="box"
-            pos="0.000000000 -0.212000000 0.000000000"
-            size="0.215000000 0.003000000 0.185000000"
-            rgba="0.15 0.15 0.15 0.25"
-            contype="1" conaffinity="1" group="0" mass="0" />
-      <!-- Bottom X-frame pipes -->
-      <geom name="xpipe_bottome1" type="capsule" fromto="-0.206249572 -0.206249572 -0.113007850 0.206249572 0.206249572 -0.113007850" size="0.005426622" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="xpipe_bottome2" type="capsule" fromto="-0.206249572 0.206249572 -0.113007850 0.206249572 -0.206249572 -0.113007850" size="0.005426622" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1" group="0" mass="0" />
+      <!-- Single +X perforated contact surface.
+           Collision and visual envelope are set to 400 mm x 380 mm on the Y-Z plane.
+           It is modeled as four thin box geoms that form one rectangular frame,
+           leaving an actual central opening instead of a solid blue cube.
+           Outer dimensions: y = 0.400 m, z = 0.380 m, x thickness = 0.006 m.
+           The contact face still lies near the +X envelope: outer face x ~= +0.215 m. -->
+      <geom name="contact_plate_px_top" type="box"
+            pos="0.212000000 0.000000000 0.180000000"
+            size="0.003000000 0.200000000 0.010000000"
+            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="contact_plate_px_bottom" type="box"
+            pos="0.212000000 0.000000000 -0.180000000"
+            size="0.003000000 0.200000000 0.010000000"
+            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="contact_plate_px_left" type="box"
+            pos="0.212000000 0.190000000 0.000000000"
+            size="0.003000000 0.010000000 0.170000000"
+            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="contact_plate_px_right" type="box"
+            pos="0.212000000 -0.190000000 0.000000000"
+            size="0.003000000 0.010000000 0.170000000"
+            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
+
+      <!-- Small visual-only dark rim to make the center hole readable in the viewer. -->
+      <geom name="contact_plate_px_inner_top_rim" type="box"
+            pos="0.215500000 0.000000000 0.170000000"
+            size="0.001000000 0.180000000 0.003000000"
+            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="contact_plate_px_inner_bottom_rim" type="box"
+            pos="0.215500000 0.000000000 -0.170000000"
+            size="0.001000000 0.180000000 0.003000000"
+            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="contact_plate_px_inner_left_rim" type="box"
+            pos="0.215500000 0.180000000 0.000000000"
+            size="0.001000000 0.003000000 0.170000000"
+            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="contact_plate_px_inner_right_rim" type="box"
+            pos="0.215500000 -0.180000000 0.000000000"
+            size="0.001000000 0.003000000 0.170000000"
+            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
       <!-- Top X-frame pipes -->
-      <geom name="xpipe_top1" type="capsule" fromto="-0.206249572 -0.206249572 0.176394928 0.206249572 0.206249572 0.176394928" size="0.008139933" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="xpipe_top2" type="capsule" fromto="-0.206249572 0.206249572 0.176394928 0.206249572 -0.206249572 0.176394928" size="0.008139933" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1" group="0" mass="0" />
-      <!-- Legs and feet -->
-      <geom name="leg1_shaft" type="capsule" fromto="-0.206249572 0.206249572 -0.177800785 -0.206249572 0.206249572 0.176394928" size="0.005426622" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg1_foot" type="box" pos="-0.206249572 0.206249572 -0.177800785" size="0.005426622 0.005426622 0.007199215" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg2_shaft" type="capsule" fromto="0.206249572 0.206249572 -0.177800785 0.206249572 0.206249572 0.176394928" size="0.005426622" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg2_foot" type="box" pos="0.206249572 0.206249572 -0.177800785" size="0.005426622 0.005426622 0.007199215" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg3_shaft" type="capsule" fromto="0.206249572 -0.206249572 -0.177800785 0.206249572 -0.206249572 0.176394928" size="0.005426622" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg3_foot" type="box" pos="0.206249572 -0.206249572 -0.177800785" size="0.005426622 0.005426622 0.007199215" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg4_shaft" type="capsule" fromto="-0.206249572 -0.206249572 -0.177800785 -0.206249572 -0.206249572 0.176394928" size="0.005426622" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="leg4_foot" type="box" pos="-0.206249572 -0.206249572 -0.177800785" size="0.005426622 0.005426622 0.007199215" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="xpipe_top1" type="capsule" fromto="-0.206249572 -0.206249572 0.000000000 0.206249572 0.206249572 0.000000000" size="0.008139933" material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="xpipe_top2" type="capsule" fromto="-0.206249572 0.206249572 0.000000000 0.206249572 -0.206249572 0.000000000" size="0.008139933" material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="xpipe_center_hub_vis" type="cylinder" pos="0 0 0" size="0.026 0.006" material="mat_dark_metal" contype="0" conaffinity="0" group="1" mass="0" />
+      <!-- Fixed visual servo mounting pads under the centered X-frame pipes. -->
+      <geom name="servo1_mount_pad_vis" type="box" pos="0.120913386 0.120913386 -0.014000000"
+            size="0.030 0.020 0.003" material="mat_dark_metal"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="servo2_mount_pad_vis" type="box" pos="-0.120913386 0.120913386 -0.014000000"
+            size="0.030 0.020 0.003" material="mat_dark_metal"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="servo3_mount_pad_vis" type="box" pos="-0.120913386 -0.120913386 -0.014000000"
+            size="0.030 0.020 0.003" material="mat_dark_metal"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <geom name="servo4_mount_pad_vis" type="box" pos="0.120913386 -0.120913386 -0.014000000"
+            size="0.030 0.020 0.003" material="mat_dark_metal"
+            contype="0" conaffinity="0" group="1" mass="0" />
+      <!-- 400 mm square-pipe legs.
+           Each box has half-length z=0.200 m, so the visible/collision leg spans
+           local z=-0.200 m to +0.200 m. The centered X-frame pipes cross at z=0. -->
+      <geom name="leg1_shaft" type="box"
+            pos="-0.206249572 0.206249572 0.000000000"
+            size="0.006000000 0.006000000 0.200000000"
+            material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="leg2_shaft" type="box"
+            pos="0.206249572 0.206249572 0.000000000"
+            size="0.006000000 0.006000000 0.200000000"
+            material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="leg3_shaft" type="box"
+            pos="0.206249572 -0.206249572 0.000000000"
+            size="0.006000000 0.006000000 0.200000000"
+            material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="leg4_shaft" type="box"
+            pos="-0.206249572 -0.206249572 0.000000000"
+            size="0.006000000 0.006000000 0.200000000"
+            material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
+
       <!-- Thruster/servo bodies. Physical mass removed; hinge inertia is in armature.
            Numbering follows Palletrone.xml:
              1: +x +y, 2: -x +y, 3: -x -y, 4: +x -y.
            Propeller disks are visual/non-collision cylinders copied from the crosstrone style
-           and placed at each X-frame propeller site. -->
-      <body name="servo1" pos="0.120913386 0.120913386 0.126394928" quat="0.9238795 0 0 0.3826834">
+           and placed at each X-frame propeller site.
+           Servo body z = -0.032 m; propeller body is offset to z=-0.055 m so the propeller sits at the lower end of the servo. -->
+      <body name="servo1" pos="0.120913386 0.120913386 -0.032000000" quat="0.9238795 0 0 0.3826834">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
         <joint name="j_servo1" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop1_body" pos="0.000000000 0.000000000 0.000000000">
-          <geom name="prop1_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="1" />
+        
+        <geom name="servo1_case_vis" type="box" pos="0.000 0.000 -0.002"
+              size="0.026 0.018 0.014" material="mat_servo"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <geom name="servo1_hinge_vis" type="cylinder" pos="0.000 0.000 0.000" quat="0.7071068 0 0.7071068 0"
+              size="0.006 0.035" material="mat_dark_metal"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <body name="prop1_body" pos="0.000000000 0.000000000 -0.055000000">
+          <geom name="prop1_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" material="mat_prop_disc" contype="0" conaffinity="0" group="1" />
+                    <geom name="motor1_can_vis" type="cylinder" pos="0 0 0.018" size="0.023 0.016"
+                material="mat_motor" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="motor1_hub_vis" type="cylinder" pos="0 0 0.006" size="0.010 0.004"
+                material="mat_dark_metal" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop1_blade1_vis" type="box" pos="0.038000 0.000000 0.004"
+                quat="1.0000000 0 0 0.0000000" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop1_blade2_vis" type="box" pos="-0.019000 0.032909 0.004"
+                quat="0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop1_blade3_vis" type="box" pos="-0.019000 -0.032909 0.004"
+                quat="-0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
           <site name="prop1_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo2" pos="-0.120913386 0.120913386 0.126394928" quat="0.3826834 0 0 0.9238795">
+      <body name="servo2" pos="-0.120913386 0.120913386 -0.032000000" quat="0.3826834 0 0 0.9238795">
         <!-- Tiny dummy inertia for MuJoCo compile stability; not intended as physical mass. -->
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
         <joint name="j_servo2" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop2_body" pos="0.000000000 0.000000000 -0.000000000">
-          <geom name="prop2_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="2" />
+        
+        <geom name="servo2_case_vis" type="box" pos="0.000 0.000 -0.002"
+              size="0.026 0.018 0.014" material="mat_servo"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <geom name="servo2_hinge_vis" type="cylinder" pos="0.000 0.000 0.000" quat="0.7071068 0 0.7071068 0"
+              size="0.006 0.035" material="mat_dark_metal"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <body name="prop2_body" pos="0.000000000 0.000000000 -0.055000000">
+          <geom name="prop2_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" material="mat_prop_disc" contype="0" conaffinity="0" group="2" />
+                    <geom name="motor2_can_vis" type="cylinder" pos="0 0 0.018" size="0.023 0.016"
+                material="mat_motor" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="motor2_hub_vis" type="cylinder" pos="0 0 0.006" size="0.010 0.004"
+                material="mat_dark_metal" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop2_blade1_vis" type="box" pos="0.038000 0.000000 0.004"
+                quat="1.0000000 0 0 0.0000000" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop2_blade2_vis" type="box" pos="-0.019000 0.032909 0.004"
+                quat="0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop2_blade3_vis" type="box" pos="-0.019000 -0.032909 0.004"
+                quat="-0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
           <site name="prop2_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo3" pos="-0.120913386 -0.120913386 0.126394928" quat="0.3826834 0 0 -0.9238795">
+      <body name="servo3" pos="-0.120913386 -0.120913386 -0.032000000" quat="0.3826834 0 0 -0.9238795">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
         <joint name="j_servo3" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop3_body" pos="0.000000000 0.000000000 -0.000000000">
-          <geom name="prop3_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="3" />
+        
+        <geom name="servo3_case_vis" type="box" pos="0.000 0.000 -0.002"
+              size="0.026 0.018 0.014" material="mat_servo"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <geom name="servo3_hinge_vis" type="cylinder" pos="0.000 0.000 0.000" quat="0.7071068 0 0.7071068 0"
+              size="0.006 0.035" material="mat_dark_metal"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <body name="prop3_body" pos="0.000000000 0.000000000 -0.055000000">
+          <geom name="prop3_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" material="mat_prop_disc" contype="0" conaffinity="0" group="3" />
+                    <geom name="motor3_can_vis" type="cylinder" pos="0 0 0.018" size="0.023 0.016"
+                material="mat_motor" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="motor3_hub_vis" type="cylinder" pos="0 0 0.006" size="0.010 0.004"
+                material="mat_dark_metal" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop3_blade1_vis" type="box" pos="0.038000 0.000000 0.004"
+                quat="1.0000000 0 0 0.0000000" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop3_blade2_vis" type="box" pos="-0.019000 0.032909 0.004"
+                quat="0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop3_blade3_vis" type="box" pos="-0.019000 -0.032909 0.004"
+                quat="-0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
           <site name="prop3_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>
-      <body name="servo4" pos="0.120913386 -0.120913386 0.126394928" quat="0.9238795 0 0 -0.3826834">
+      <body name="servo4" pos="0.120913386 -0.120913386 -0.032000000" quat="0.9238795 0 0 -0.3826834">
         <inertial pos="0.000000000 0.000000000 0.000000000" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
         <joint name="j_servo4" type="hinge" axis="1 0 0" pos="0.000000000 0.000000000 0.000000000" limited="true" range="-1.57079632679 1.57079632679" armature="0.005" damping="0.02" />
-        <body name="prop4_body" pos="0.000000000 0.000000000 0.000000000">
-          <geom name="prop4_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" rgba="0.85 0.55 0.0 0.7" contype="0" conaffinity="0" group="4" />
+        
+        <geom name="servo4_case_vis" type="box" pos="0.000 0.000 -0.002"
+              size="0.026 0.018 0.014" material="mat_servo"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <geom name="servo4_hinge_vis" type="cylinder" pos="0.000 0.000 0.000" quat="0.7071068 0 0.7071068 0"
+              size="0.006 0.035" material="mat_dark_metal"
+              contype="0" conaffinity="0" group="1" mass="0" />
+        <body name="prop4_body" pos="0.000000000 0.000000000 -0.055000000">
+          <geom name="prop4_col" type="cylinder" pos="0.000000000 0.000000000 0.000000000" size="0.0762 0.001" mass="1e-9" material="mat_prop_disc" contype="0" conaffinity="0" group="4" />
+                    <geom name="motor4_can_vis" type="cylinder" pos="0 0 0.018" size="0.023 0.016"
+                material="mat_motor" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="motor4_hub_vis" type="cylinder" pos="0 0 0.006" size="0.010 0.004"
+                material="mat_dark_metal" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop4_blade1_vis" type="box" pos="0.038000 0.000000 0.004"
+                quat="1.0000000 0 0 0.0000000" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop4_blade2_vis" type="box" pos="-0.019000 0.032909 0.004"
+                quat="0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
+          <geom name="prop4_blade3_vis" type="box" pos="-0.019000 -0.032909 0.004"
+                quat="-0.5000000 0 0 0.8660254" size="0.041 0.0065 0.0008"
+                material="mat_prop" contype="0" conaffinity="0" group="1" mass="0" />
           <site name="prop4_site" pos="0.000000000 0.000000000 0.000000000" size="0.005426622" type="sphere" rgba="1 1 1 0" />
         </body>
       </body>

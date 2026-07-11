@@ -43,10 +43,6 @@ def generate_launch_description():
     start_controllers_after_plant = RegisterEventHandler(
         OnProcessStart(
             target_action=plant,
-            # MoB/wrench_observer is intentionally not launched here.
-            # Start it manually when needed:
-            #   ros2 run minitrone_controller minitrone_first_wrench_observer
-            # It publishes /minitrone/external_wrench_hat for monitoring only.
             on_start=[wrench_controller, allocator_controller, ekf_state_estimator]
         )
     )

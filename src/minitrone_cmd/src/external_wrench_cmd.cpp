@@ -27,8 +27,8 @@ public:
     this->declare_parameter<double>("publish_hz", 50.0);
     this->declare_parameter<double>("force_step", 0.5);
     this->declare_parameter<double>("moment_step", 0.1);
-    this->declare_parameter<double>("force_limit", 10.0);
-    this->declare_parameter<double>("moment_limit", 5.0);
+    this->declare_parameter<double>("force_limit", 50.0);
+    this->declare_parameter<double>("moment_limit", 10.0);
     // 사인파의 진폭(A) 기본값 설정
     this->declare_parameter<double>("moment_disturbance_amplitude", 0.3);
     // 사인파의 주파수(f, Hz) 기본값 설정

@@ -11,8 +11,8 @@ from std_msgs.msg import Float64MultiArray
 
 RAD2DEG = 180.0 / math.pi
 DEG2RAD = math.pi / 180.0
-POS_STEP = 0.002
-ANG_STEP = 0.5 * DEG2RAD
+POS_STEP = 0.001
+ANG_STEP = 0.1 * DEG2RAD
 
 
 class PalmTeleop(Node):
@@ -34,7 +34,7 @@ class PalmTeleop(Node):
 
     def _print_help(self):
         self.get_logger().info(
-            'Palm teleop keys: up/down +x/-x, left/right +y/-y, [/ ] +z/-z, O/P roll +10/-10 deg, U/I pitch +10/-10 deg, J/K yaw +10/-10 deg, R reset, Q quit'
+            'Palm teleop keys: W/S +x/-x, A/D +y/-y, R/F +z/-z, U/O roll +/-, I/K pitch +/-, J/L yaw +/-, 0 reset, Q quit. Arrows and [/] also work.'
         )
 
     def _palm_pose_state_callback(self, msg: Float64MultiArray):
@@ -85,19 +85,31 @@ class PalmTeleop(Node):
                 self.pose[2] += POS_STEP
             elif key == ']':
                 self.pose[2] -= POS_STEP
-            elif key.lower() == 'o':
-                self.pose[3] += ANG_STEP
-            elif key.lower() == 'p':
-                self.pose[3] -= ANG_STEP
+            elif key.lower() == 'w':
+                self.pose[0] += POS_STEP
+            elif key.lower() == 's':
+                self.pose[0] -= POS_STEP
+            elif key.lower() == 'a':
+                self.pose[1] += POS_STEP
+            elif key.lower() == 'd':
+                self.pose[1] -= POS_STEP
+            elif key.lower() == 'r':
+                self.pose[2] += POS_STEP
+            elif key.lower() == 'f':
+                self.pose[2] -= POS_STEP
             elif key.lower() == 'u':
-                self.pose[4] += ANG_STEP
+                self.pose[3] += ANG_STEP
+            elif key.lower() == 'o':
+                self.pose[3] -= ANG_STEP
             elif key.lower() == 'i':
+                self.pose[4] += ANG_STEP
+            elif key.lower() == 'k':
                 self.pose[4] -= ANG_STEP
             elif key.lower() == 'j':
                 self.pose[5] += ANG_STEP
-            elif key.lower() == 'k':
+            elif key.lower() == 'l':
                 self.pose[5] -= ANG_STEP
-            elif key.lower() == 'r':
+            elif key == '0':
                 self.pose[:] = self.reset_pose.copy()
             else:
                 changed = False
