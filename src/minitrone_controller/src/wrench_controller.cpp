@@ -67,20 +67,20 @@ public:
       declare_parameter<std::string>("cmd_topic", "/minitrone/cmd");
     const std::string att_cmd_topic =
       declare_parameter<std::string>("att_cmd_topic", "/minitrone/att_cmd");
-    const std::string impedance_cmd_topic =
-      declare_parameter<std::string>("impedance_cmd_topic", "/minitrone/cmd_impedance");
-    const std::string impedance_att_cmd_topic =
-      declare_parameter<std::string>("impedance_att_cmd_topic", "/minitrone/att_cmd_impedance");
-    const std::string impedance_active_topic =
-      declare_parameter<std::string>("impedance_active_topic", "/minitrone/impedance_active");
+    const std::string admittance_cmd_topic =
+      declare_parameter<std::string>("admittance_cmd_topic", "/minitrone/cmd_admittance");
+    const std::string admittance_att_cmd_topic =
+      declare_parameter<std::string>("admittance_att_cmd_topic", "/minitrone/att_cmd_admittance");
+    const std::string admittance_active_topic =
+      declare_parameter<std::string>("admittance_active_topic", "/minitrone/admittance_active");
 
     // ===================== ROS I/O =====================
     sub_cmd_ = this->create_subscription<minitrone_interfaces::msg::Cmd>(
       cmd_topic, 10, std::bind(&WrenchController::onCmd, this, std::placeholders::_1));
 
-    sub_impedance_cmd_ = this->create_subscription<minitrone_interfaces::msg::Cmd>(
-      impedance_cmd_topic, 10,
-      std::bind(&WrenchController::onImpedanceCmd, this, std::placeholders::_1));
+    sub_admittance_cmd_ = this->create_subscription<minitrone_interfaces::msg::Cmd>(
+      admittance_cmd_topic, 10,
+      std::bind(&WrenchController::onAdmittanceCmd, this, std::placeholders::_1));
 
     sub_state_ = this->create_subscription<minitrone_interfaces::msg::MinitroneState>(
       "/minitrone/state", 10, std::bind(&WrenchController::onState, this, std::placeholders::_1));
@@ -88,14 +88,14 @@ public:
     sub_att_cmd_ = this->create_subscription<minitrone_interfaces::msg::AttitudeCmd>(
       att_cmd_topic, 10, std::bind(&WrenchController::onAttCmd, this, std::placeholders::_1));
 
-    sub_impedance_att_cmd_ =
+    sub_admittance_att_cmd_ =
       this->create_subscription<minitrone_interfaces::msg::AttitudeCmd>(
-      impedance_att_cmd_topic, 10,
-      std::bind(&WrenchController::onImpedanceAttCmd, this, std::placeholders::_1));
+      admittance_att_cmd_topic, 10,
+      std::bind(&WrenchController::onAdmittanceAttCmd, this, std::placeholders::_1));
 
-    sub_impedance_active_ = this->create_subscription<std_msgs::msg::Bool>(
-      impedance_active_topic, 10,
-      std::bind(&WrenchController::onImpedanceActive, this, std::placeholders::_1));
+    sub_admittance_active_ = this->create_subscription<std_msgs::msg::Bool>(
+      admittance_active_topic, 10,
+      std::bind(&WrenchController::onAdmittanceActive, this, std::placeholders::_1));
 
     // allocator가 /wrench 또는 /wrench_cmd 중 무엇을 보든 안전하게
     pub_wrench_     = this->create_publisher<minitrone_interfaces::msg::Wrench>("/minitrone/wrench", 10);
@@ -116,12 +116,12 @@ private:
     tryPublish();
   }
 
-  void onImpedanceCmd(const minitrone_interfaces::msg::Cmd::SharedPtr msg)
+  void onAdmittanceCmd(const minitrone_interfaces::msg::Cmd::SharedPtr msg)
   {
-    impedance_pos_cmd_ << static_cast<double>(msg->pos_cmd[0]),
+    admittance_pos_cmd_ << static_cast<double>(msg->pos_cmd[0]),
                           static_cast<double>(msg->pos_cmd[1]),
                           static_cast<double>(msg->pos_cmd[2]);
-    have_impedance_cmd_ = true;
+    have_admittance_cmd_ = true;
   }
 
   void onAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
@@ -134,17 +134,17 @@ private:
     tryPublish();
   }
 
-  void onImpedanceAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
+  void onAdmittanceAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
   {
-    impedance_att_cmd_ << static_cast<double>(msg->roll_ref) * deg_to_rad,
+    admittance_att_cmd_ << static_cast<double>(msg->roll_ref) * deg_to_rad,
                           static_cast<double>(msg->pitch_ref) * deg_to_rad,
                           static_cast<double>(msg->yaw_ref) * deg_to_rad;
-    have_impedance_att_cmd_ = true;
+    have_admittance_att_cmd_ = true;
   }
 
-  void onImpedanceActive(const std_msgs::msg::Bool::SharedPtr msg)
+  void onAdmittanceActive(const std_msgs::msg::Bool::SharedPtr msg)
   {
-    impedance_active_ = msg->data;
+    admittance_active_ = msg->data;
   }
 
   void onState(const minitrone_interfaces::msg::MinitroneState::SharedPtr msg)
@@ -169,9 +169,9 @@ private:
 
     // ===== (중요) 명령 없으면 "현재 위치 유지" =====
     // pos_ref = 0 으로 두면 초기 위치가 0이 아닐 때 순간적으로 큰 힘이 나가서 튕김.
-    const bool use_impedance_cmd = impedance_active_ && have_impedance_cmd_;
+    const bool use_admittance_cmd = admittance_active_ && have_admittance_cmd_;
     const Eigen::Vector3d pos_ref =
-      use_impedance_cmd ? impedance_pos_cmd_ : (have_cmd_ ? pos_cmd_ : pos_);
+      use_admittance_cmd ? admittance_pos_cmd_ : (have_cmd_ ? pos_cmd_ : pos_);
 
     Eigen::Vector3d position_pid;
     position_pid.x() = pid_pos_[0](pos_ref.x(), pos_.x(), vel_.x(), dt);
@@ -197,10 +197,10 @@ private:
     const Eigen::Vector3d F_body = R_WB.transpose() * F_world;
 
     // ===== attitude reference =====
-    const bool use_impedance_att_cmd = impedance_active_ && have_impedance_att_cmd_;
+    const bool use_admittance_att_cmd = admittance_active_ && have_admittance_att_cmd_;
     Eigen::Vector3d att_ref =
-      use_impedance_att_cmd ?
-      impedance_att_cmd_ :
+      use_admittance_att_cmd ?
+      admittance_att_cmd_ :
       (have_att_cmd_ ? att_cmd_ : Eigen::Vector3d::Zero());
     const double r_ref_d = att_ref.x();
     const double p_ref_d = att_ref.y();
@@ -232,11 +232,11 @@ private:
 
   // ROS
   rclcpp::Subscription<minitrone_interfaces::msg::Cmd>::SharedPtr            sub_cmd_;
-  rclcpp::Subscription<minitrone_interfaces::msg::Cmd>::SharedPtr            sub_impedance_cmd_;
+  rclcpp::Subscription<minitrone_interfaces::msg::Cmd>::SharedPtr            sub_admittance_cmd_;
   rclcpp::Subscription<minitrone_interfaces::msg::MinitroneState>::SharedPtr sub_state_;
   rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_att_cmd_;
-  rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_impedance_att_cmd_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_impedance_active_;
+  rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_admittance_att_cmd_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_admittance_active_;
   rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr            pub_wrench_;
   rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr            pub_wrench_cmd_;
 
@@ -244,13 +244,13 @@ private:
 
   // state/command
   Eigen::Vector3d pos_cmd_{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d impedance_pos_cmd_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d admittance_pos_cmd_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d pos_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vel_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d rpy_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d w_body_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d att_cmd_{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d impedance_att_cmd_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d admittance_att_cmd_{Eigen::Vector3d::Zero()};
 
   std::function<double(double,double,double,double)> pid_pos_[3];
   std::function<double(double,double,double,double)> pid_att_[3];
@@ -258,8 +258,8 @@ private:
   double mass_{1.0};
   double grav_{9.81};
   bool have_state_{false}, have_cmd_{false}, have_att_cmd_{false};
-  bool have_impedance_cmd_{false}, have_impedance_att_cmd_{false};
-  bool impedance_active_{false};
+  bool have_admittance_cmd_{false}, have_admittance_att_cmd_{false};
+  bool admittance_active_{false};
 };
 
 int main(int argc, char** argv)

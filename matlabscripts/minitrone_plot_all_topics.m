@@ -20,7 +20,7 @@ external_force_ylim = [-0.3, 0.3];
 enable_external_force_ytick = false;
 external_force_ytick_step = 0.1;
 
-impedance_n_face_body = [1, 0, 0];
+admittance_n_face_body = [1, 0, 0];
 
 %========================================================%
 % Read CSV
@@ -54,7 +54,7 @@ mob_observer_input = topic_table(all_topics, "/minitrone/mob_observer_input");
 wrench_hat = topic_table(all_topics, "/minitrone/external_wrench_hat");
 wrench_hat_second = topic_table(all_topics, "/minitrone/external_wrench_hat_second_order");
 external_wrench_cmd = topic_table(all_topics, "/minitrone/external_wrench_cmd");
-impedance_des_force_topic = topic_table(all_topics, "/minitrone/impedance_des_force");
+admittance_des_force_topic = topic_table(all_topics, "/minitrone/admittance_des_force");
 
 t0 = choose_t0(state, all_topics);
 
@@ -218,7 +218,7 @@ if has_rows(wrench_hat_second)
     th = wrench_hat_second.t_sec - t0;
     [~, Fhat_imp] = wrench_columns(wrench_hat_second, "external_wrench_hat_second_order");
 
-    n_face_body = impedance_n_face_body(:);
+    n_face_body = admittance_n_face_body(:);
     if norm(n_face_body) < 1e-9
         n_face_body = [1; 0; 0];
     end
@@ -228,14 +228,14 @@ if has_rows(wrench_hat_second)
                             n_face_body(2) * Fhat_imp{2} + ...
                             n_face_body(3) * Fhat_imp{3}));
 
-    if has_rows(impedance_des_force_topic)
-        td = impedance_des_force_topic.t_sec - t0;
-        f_des = col(impedance_des_force_topic, "impedance_des_force__data", "data");
+    if has_rows(admittance_des_force_topic)
+        td = admittance_des_force_topic.t_sec - t0;
+        f_des = col(admittance_des_force_topic, "admittance_des_force__data", "data");
         f_des_normal = previous_interp(td, f_des, th);
         has_f_des_normal = true;
     else
         has_f_des_normal = false;
-        warning("No /minitrone/impedance_des_force topic; skipping F_des in Normal Force plot.");
+        warning("No /minitrone/admittance_des_force topic; skipping F_des in Normal Force plot.");
     end
 
     has_act_normal = has_rows(actuation_wrench_body);

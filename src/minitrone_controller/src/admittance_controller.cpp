@@ -52,17 +52,17 @@ double moveToward(double current, double target, double max_step)
 }
 }  // namespace
 
-class ImpedanceController : public rclcpp::Node
+class AdmittanceController : public rclcpp::Node
 {
 public:
   enum class Mode
   {
     NORMAL,
-    IMPEDANCE
+    ADMITTANCE
   };
 
-  ImpedanceController()
-  : rclcpp::Node("minitrone_impedance_controller")
+  AdmittanceController()
+  : rclcpp::Node("minitrone_admittance_controller")
   {
     // ========================================================================
     // 1. 접촉면 방향 설정
@@ -228,7 +228,7 @@ public:
     x_dot_max_ = declare_parameter<double>("x_dot_max", 0.05);   // [m/s]
 
     // x_delta_max [m]
-    // I를 눌러 impedance mode에 들어간 기준 위치로부터 접촉 방향으로 이동할 수 있는
+    // I를 눌러 admittance mode에 들어간 기준 위치로부터 접촉 방향으로 이동할 수 있는
     // 최대 위치 보정량의 절댓값이다. +방향과 -방향에 동일하게 적용된다.
     // 접촉 대상이 사라져도 드론이 무한히 이동하는 것을 막는 최종 안전 제한이다.
     // 예: 0.12 m이면 mode 진입 기준점에서 최대 ±12 cm 이동 가능하다.
@@ -253,41 +253,41 @@ public:
 
     sub_cmd_ = create_subscription<minitrone_interfaces::msg::Cmd>(
       "/minitrone/cmd", 10,
-      std::bind(&ImpedanceController::onCmd, this, std::placeholders::_1));
+      std::bind(&AdmittanceController::onCmd, this, std::placeholders::_1));
 
     sub_att_cmd_ = create_subscription<minitrone_interfaces::msg::AttitudeCmd>(
       "/minitrone/att_cmd", 10,
-      std::bind(&ImpedanceController::onAttCmd, this, std::placeholders::_1));
+      std::bind(&AdmittanceController::onAttCmd, this, std::placeholders::_1));
 
     sub_state_ = create_subscription<minitrone_interfaces::msg::MinitroneState>(
       "/minitrone/state", 10,
-      std::bind(&ImpedanceController::onState, this, std::placeholders::_1));
+      std::bind(&AdmittanceController::onState, this, std::placeholders::_1));
 
     sub_external_wrench_ = create_subscription<minitrone_interfaces::msg::Wrench>(
       "/minitrone/external_wrench_hat_second_order", 10,
-      std::bind(&ImpedanceController::onExternalWrench, this, std::placeholders::_1));
+      std::bind(&AdmittanceController::onExternalWrench, this, std::placeholders::_1));
 
     pub_cmd_ =
-      create_publisher<minitrone_interfaces::msg::Cmd>("/minitrone/cmd_impedance", 10);
+      create_publisher<minitrone_interfaces::msg::Cmd>("/minitrone/cmd_admittance", 10);
     pub_att_cmd_ = create_publisher<minitrone_interfaces::msg::AttitudeCmd>(
-      "/minitrone/att_cmd_impedance", 10);
-    pub_impedance_active_ =
-      create_publisher<std_msgs::msg::Bool>("/minitrone/impedance_active", 10);
-    pub_impedance_des_force_ =
-      create_publisher<std_msgs::msg::Float64>("/minitrone/impedance_des_force", 10);
+      "/minitrone/att_cmd_admittance", 10);
+    pub_admittance_active_ =
+      create_publisher<std_msgs::msg::Bool>("/minitrone/admittance_active", 10);
+    pub_admittance_des_force_ =
+      create_publisher<std_msgs::msg::Float64>("/minitrone/admittance_des_force", 10);
 
     setupKeyboard();
     keyboard_timer_ = create_wall_timer(
       std::chrono::milliseconds(20),
-      std::bind(&ImpedanceController::pollKeyboard, this));
+      std::bind(&AdmittanceController::pollKeyboard, this));
 
     last_time_ = now();
-    publishImpedanceActive();
-    publishImpedanceDesiredForce();
+    publishAdmittanceActive();
+    publishAdmittanceDesiredForce();
 
     RCLCPP_INFO(
       get_logger(),
-      "Keyboard: I=toggle impedance, "
+      "Keyboard: I=toggle admittance, "
       "U=desired force +%.2f N, "
       "J=desired force -%.2f N "
       "(current %.2f N)",
@@ -296,7 +296,7 @@ public:
       f_normal_des_);
   }
 
-  ~ImpedanceController() override
+  ~AdmittanceController() override
   {
     restoreKeyboard();
   }
@@ -332,11 +332,11 @@ private:
     f_normal_ref_active_ = 0.0;
   }
 
-  void enterImpedanceMode(const Eigen::Vector3d & n_face_world)
+  void enterAdmittanceMode(const Eigen::Vector3d & n_face_world)
   {
-    mode_ = Mode::IMPEDANCE;
+    mode_ = Mode::ADMITTANCE;
 
-    // Keep the contact direction fixed in the world frame during one impedance
+    // Keep the contact direction fixed in the world frame during one admittance
     // episode. This is appropriate for contact with a fixed plate/wall and avoids
     // reference rotation caused by small attitude changes.
     n_contact_world_ = n_face_world;
@@ -347,7 +347,7 @@ private:
 
     // Bumpless mode entry: start at the last position reference that was actually
     // published instead of jumping to a separate approach/contact reference.
-    p_impedance_base_world_ = pos_ref_initialized_ ? last_pos_ref_world_ : pos_;
+    p_admittance_base_world_ = pos_ref_initialized_ ? last_pos_ref_world_ : pos_;
 
     x_adm_delta_ = 0.0;
     x_adm_dot_ = 0.0;
@@ -361,54 +361,54 @@ private:
 
     RCLCPP_INFO(
       get_logger(),
-      "impedance mode ON: continuous force control, F_raw=%.3f N, F_lpf=%.3f N",
+      "admittance mode ON: continuous force control, F_raw=%.3f N, F_lpf=%.3f N",
       f_normal_raw_,
       f_normal_hat_);
   }
 
-  void setImpedanceArmed(bool armed)
+  void setAdmittanceArmed(bool armed)
   {
-    if (impedance_armed_ == armed) {
+    if (admittance_armed_ == armed) {
       return;
     }
 
-    impedance_armed_ = armed;
+    admittance_armed_ = armed;
 
-    if (impedance_armed_) {
+    if (admittance_armed_) {
       if (have_state_) {
         const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
-        enterImpedanceMode(r_wb * n_face_body_);
+        enterAdmittanceMode(r_wb * n_face_body_);
       } else {
         mode_ = Mode::NORMAL;
         resetAdmittanceState();
-        RCLCPP_INFO(get_logger(), "impedance mode requested; waiting for state");
+        RCLCPP_INFO(get_logger(), "admittance mode requested; waiting for state");
       }
     } else {
       mode_ = Mode::NORMAL;
       resetAdmittanceState();
-      RCLCPP_INFO(get_logger(), "impedance mode OFF: NORMAL");
+      RCLCPP_INFO(get_logger(), "admittance mode OFF: NORMAL");
     }
 
-    publishImpedanceActive();
+    publishAdmittanceActive();
   }
 
-  void publishImpedanceActive()
+  void publishAdmittanceActive()
   {
     std_msgs::msg::Bool msg;
-    msg.data = impedance_armed_;
-    pub_impedance_active_->publish(msg);
+    msg.data = admittance_armed_;
+    pub_admittance_active_->publish(msg);
   }
 
-  void publishImpedanceDesiredForce()
+  void publishAdmittanceDesiredForce()
   {
     std_msgs::msg::Float64 msg;
     msg.data = f_normal_des_;
-    pub_impedance_des_force_->publish(msg);
+    pub_admittance_des_force_->publish(msg);
   }
 
-  void toggleImpedance()
+  void toggleAdmittance()
   {
-    setImpedanceArmed(!impedance_armed_);
+    setAdmittanceArmed(!admittance_armed_);
   }
 
   void adjustDesiredForce(double delta)
@@ -438,7 +438,7 @@ private:
         f_normal_min_,
         f_normal_max_);
     }
-    publishImpedanceDesiredForce();
+    publishAdmittanceDesiredForce();
   }
 
   void setupKeyboard()
@@ -502,7 +502,7 @@ private:
     }
 
     if (key == 'I' || key == 'i') {
-      toggleImpedance();
+      toggleAdmittance();
     } else if (key == 'U' || key == 'u') {
       adjustDesiredForce(+f_normal_step_);
     } else if (key == 'J' || key == 'j') {
@@ -539,8 +539,8 @@ private:
       return target;
     }
 
-    // Do not alter the ordinary position command while impedance is disabled.
-    if (!impedance_armed_) {
+    // Do not alter the ordinary position command while admittance is disabled.
+    if (!admittance_armed_) {
       last_pos_ref_world_ = target;
       return target;
     }
@@ -569,10 +569,10 @@ private:
     const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
     const Eigen::Vector3d n_face_world = r_wb * n_face_body_;
 
-    // The force estimator is updated on every state callback. While impedance
+    // The force estimator is updated on every state callback. While admittance
     // mode is active, use the world-fixed contact direction selected at mode entry.
     const Eigen::Vector3d & force_normal_world =
-      (impedance_armed_ && mode_ == Mode::IMPEDANCE) ? n_contact_world_ : n_face_world;
+      (admittance_armed_ && mode_ == Mode::ADMITTANCE) ? n_contact_world_ : n_face_world;
     updateNormalForce(dt, r_wb, force_normal_world);
 
     const Eigen::Vector3d pos_ref_target = computePositionReference(dt, n_face_world);
@@ -586,8 +586,8 @@ private:
     pub_cmd_->publish(cmd_msg);
     pub_att_cmd_->publish(
       have_att_cmd_ ? att_cmd_msg_ : minitrone_interfaces::msg::AttitudeCmd());
-    publishImpedanceActive();
-    publishImpedanceDesiredForce();
+    publishAdmittanceActive();
+    publishAdmittanceDesiredForce();
   }
 
   double filteredAndLimitedForceError() const
@@ -616,7 +616,7 @@ private:
     const double delta_limit = std::abs(x_delta_max_);
 
     // There is intentionally no contact-present/contact-released condition here.
-    // As long as I has enabled impedance mode, force error is processed every cycle,
+    // As long as I has enabled admittance mode, force error is processed every cycle,
     // even when the estimated normal force is zero.
     const bool pushing_beyond_positive_limit =
       x_adm_delta_ >= delta_limit && force_error > 0.0;
@@ -675,14 +675,14 @@ private:
     double dt,
     const Eigen::Vector3d & n_face_world)
   {
-    if (!impedance_armed_) {
+    if (!admittance_armed_) {
       mode_ = Mode::NORMAL;
       return have_cmd_ ? pos_cmd_ : pos_;
     }
 
     // This is reached when I was pressed before the first state message arrived.
-    if (mode_ != Mode::IMPEDANCE) {
-      enterImpedanceMode(n_face_world);
+    if (mode_ != Mode::ADMITTANCE) {
+      enterAdmittanceMode(n_face_world);
     }
 
     // Smoothly change the force target. No contact threshold is involved.
@@ -694,7 +694,7 @@ private:
     // Always run force-error admittance while I-mode is ON.
     integrateAdmittance(dt);
 
-    return p_impedance_base_world_ + x_adm_delta_ * n_contact_world_;
+    return p_admittance_base_world_ + x_adm_delta_ * n_contact_world_;
   }
 
   void updateNormalForce(
@@ -736,8 +736,8 @@ private:
   rclcpp::Subscription<minitrone_interfaces::msg::Wrench>::SharedPtr sub_external_wrench_;
   rclcpp::Publisher<minitrone_interfaces::msg::Cmd>::SharedPtr pub_cmd_;
   rclcpp::Publisher<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr pub_att_cmd_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_impedance_active_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_impedance_des_force_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_admittance_active_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_admittance_des_force_;
   rclcpp::TimerBase::SharedPtr keyboard_timer_;
 
   rclcpp::Time last_time_;
@@ -757,9 +757,9 @@ private:
   // 작은 자세 변화로 force 투영 방향과 위치 이동 방향이 흔들리는 것을 막는다.
   Eigen::Vector3d n_contact_world_{Eigen::Vector3d::UnitX()};
 
-  // Impedance mode 진입 시 기준 위치 [m]. 최종 명령은
-  // p_impedance_base_world_ + x_adm_delta_ * n_contact_world_ 로 계산된다.
-  Eigen::Vector3d p_impedance_base_world_{Eigen::Vector3d::Zero()};
+  // Admittance mode 진입 시 기준 위치 [m]. 최종 명령은
+  // p_admittance_base_world_ + x_adm_delta_ * n_contact_world_ 로 계산된다.
+  Eigen::Vector3d p_admittance_base_world_{Eigen::Vector3d::Zero()};
 
   // 직전 제어 주기에 실제 publish한 위치 reference [m].
   // pos_ref_rate_max에 의한 slew-rate limit과 bumpless mode entry에 사용한다.
@@ -796,7 +796,7 @@ private:
   double force_error_integral_{0.0};       // force error 시간 적분값 [N*s]
 
   Mode mode_{Mode::NORMAL};
-  bool impedance_armed_{false};
+  bool admittance_armed_{false};
   bool have_cmd_{false};
   bool have_att_cmd_{false};
   bool have_state_{false};
@@ -811,7 +811,7 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ImpedanceController>());
+  rclcpp::spin(std::make_shared<AdmittanceController>());
   rclcpp::shutdown();
   return 0;
 }

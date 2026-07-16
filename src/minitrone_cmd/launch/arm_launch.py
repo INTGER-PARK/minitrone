@@ -54,8 +54,8 @@ def generate_launch_description():
         OnProcessStart(
             target_action=plant,
             # Normal: cmd/att_cmd -> wrench controller -> allocator.
-            # Optional impedance override uses second-order MoB output and is
-            # toggled from minitrone_impedance_controller in a terminal.
+            # Optional admittance override uses second-order MoB output and is
+            # toggled from minitrone_admittance_controller in a terminal.
             on_start=[second_mob, wrench_controller, allocator_controller]
         )
     )

@@ -17,10 +17,10 @@ add_executable(minitrone_wrench_controller src/wrench_controller.cpp)
 ament_target_dependencies(minitrone_wrench_controller rclcpp minitrone_interfaces std_msgs)
 target_link_libraries(minitrone_wrench_controller Eigen3::Eigen)
 
-# minitrone_impedance_controller
-add_executable(minitrone_impedance_controller src/impedance_controller.cpp)
-ament_target_dependencies(minitrone_impedance_controller rclcpp minitrone_interfaces std_msgs)
-target_link_libraries(minitrone_impedance_controller Eigen3::Eigen)
+# minitrone_admittance_controller
+add_executable(minitrone_admittance_controller src/admittance_controller.cpp)
+ament_target_dependencies(minitrone_admittance_controller rclcpp minitrone_interfaces std_msgs)
+target_link_libraries(minitrone_admittance_controller Eigen3::Eigen)
 
 # minitrone_allocator_controller
 add_executable(minitrone_allocator_controller src/allocator_controller.cpp)
@@ -44,7 +44,7 @@ target_link_libraries(minitrone_ekf_state_estimator Eigen3::Eigen)
 
 install(TARGETS
   minitrone_wrench_controller
-  minitrone_impedance_controller
+  minitrone_admittance_controller
   minitrone_allocator_controller
   minitrone_first_wrench_observer
   minitrone_second_wrench_observer
