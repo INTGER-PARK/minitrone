@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <minitrone_interfaces/msg/center_of_pressure.hpp>
 #include <minitrone_interfaces/msg/mob_observer_input.hpp>
 #include <minitrone_interfaces/msg/wrench.hpp>
 
@@ -60,6 +61,11 @@ public:
     // Fixed simulation/state period used by the discrete observer update.
     // Unit: s. Default 1/400 s = 0.0025 s.
     state_dt_ = this->declare_parameter<double>("state_dt", 1.0 / 400.0);
+    cop_force_min_ = std::abs(this->declare_parameter<double>("cop_force_min", 0.5));
+    cop_half_y_ = std::max(
+      1e-6, 0.5 * std::abs(this->declare_parameter<double>("plate_size_y", 0.40)));
+    cop_half_z_ = std::max(
+      1e-6, 0.5 * std::abs(this->declare_parameter<double>("plate_size_z", 0.38)));
 
     inertia_body_.setZero();
     inertia_body_(0, 0) = inertia_xx_;
@@ -79,6 +85,8 @@ public:
       });
 
     pub_external_wrench_hat_ = create_publisher<minitrone_interfaces::msg::Wrench>(output_topic_, 10);
+    pub_cop_hat_ = create_publisher<minitrone_interfaces::msg::CenterOfPressure>(
+      "/minitrone/cop_hat", 10);
   }
 
 private:
@@ -212,6 +220,21 @@ private:
     msg.moment[1] = static_cast<float>(moment_body.y());
     msg.moment[2] = static_cast<float>(moment_body.z());
     pub_external_wrench_hat_->publish(msg);
+
+    minitrone_interfaces::msg::CenterOfPressure cop;
+    cop.normal_force = -force_body.x();
+    cop.valid = std::isfinite(cop.normal_force) && cop.normal_force >= cop_force_min_;
+    if (cop.valid) {
+      cop.y = moment_body.z() / cop.normal_force;
+      cop.z = -moment_body.y() / cop.normal_force;
+      const double yu = std::clamp(cop.y / cop_half_y_, -1.0, 1.0);
+      const double zu = std::clamp(cop.z / cop_half_z_, -1.0, 1.0);
+      cop.corner_forces[0] = cop.normal_force * 0.25 * (1.0 + yu) * (1.0 + zu);
+      cop.corner_forces[1] = cop.normal_force * 0.25 * (1.0 - yu) * (1.0 + zu);
+      cop.corner_forces[2] = cop.normal_force * 0.25 * (1.0 - yu) * (1.0 - zu);
+      cop.corner_forces[3] = cop.normal_force * 0.25 * (1.0 + yu) * (1.0 - zu);
+    }
+    pub_cop_hat_->publish(cop);
   }
 
   struct SecondOrderMobFilter
@@ -284,6 +307,7 @@ private:
   rclcpp::Subscription<minitrone_interfaces::msg::MobObserverInput>::SharedPtr
     sub_mob_observer_input_;
   rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr pub_external_wrench_hat_;
+  rclcpp::Publisher<minitrone_interfaces::msg::CenterOfPressure>::SharedPtr pub_cop_hat_;
 
   std::string output_topic_{"/minitrone/external_wrench_hat_second_order"};
   double mass_{4.0};
@@ -292,6 +316,9 @@ private:
   double inertia_yy_{0.360702};
   double inertia_zz_{0.660702};
   double state_dt_{1.0 / 400.0};
+  double cop_force_min_{0.5};
+  double cop_half_y_{0.20};
+  double cop_half_z_{0.19};
   double prev_sim_time_{0.0};
 
   Eigen::Vector3d omega_n_force_{kDefaultOmegaN, kDefaultOmegaN, kDefaultOmegaN};

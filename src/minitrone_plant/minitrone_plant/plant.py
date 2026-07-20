@@ -10,7 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 import mujoco
 import mujoco.viewer
 
-from minitrone_interfaces.msg import Input, MinitroneState, MobObserverInput, Wrench
+from minitrone_interfaces.msg import CenterOfPressure, Input, MinitroneState, MobObserverInput, Wrench
 from std_msgs.msg import Float64MultiArray
 
 PHYSICS_HZ = 400.0
@@ -125,6 +125,14 @@ class PlantRosNode(Node):
 
         # for COM printing (use drone_base body)
         self.base_body_id = bid("drone_base")
+        self.contact_plate_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "contact_plate_px"
+        )
+        if self.contact_plate_geom_id < 0:
+            raise RuntimeError("Contact geom 'contact_plate_px' not found in XML")
+        self.cop_half_y = 0.200
+        self.cop_half_z = 0.190
+        self.cop_force_min = 0.5
         self.prop_site_id = [
             siteid("prop1_site"),
             siteid("prop2_site"),
@@ -134,13 +142,25 @@ class PlantRosNode(Node):
 
         self.palm_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand_palm")
         self.palm_mocap_id = -1
+        self.palm_pose_cmd = None
+        self.palm_home_pos = np.array([1.4, 0.0, 1.0], dtype=float)
+        self.aid_palm = []
         if self.palm_body_id >= 0:
             self.palm_mocap_id = int(self.model.body_mocapid[self.palm_body_id])
             if self.palm_mocap_id >= 0:
                 self.data.mocap_pos[self.palm_mocap_id] = self.model.body_pos[self.palm_body_id]
                 self.data.mocap_quat[self.palm_mocap_id] = self.model.body_quat[self.palm_body_id]
             else:
-                self.get_logger().warn("Body 'hand_palm' exists but is not a mocap body")
+                self.palm_home_pos = np.array([1.4, 0.0, 1.0], dtype=float)
+                self.palm_pose_cmd = np.concatenate((self.palm_home_pos, np.zeros(3, dtype=float)))
+                self.aid_palm = [
+                    aid("hand_palm_slide_x_pos"),
+                    aid("hand_palm_slide_y_pos"),
+                    aid("hand_palm_slide_z_pos"),
+                    aid("hand_palm_roll_pos"),
+                    aid("hand_palm_pitch_pos"),
+                    aid("hand_palm_yaw_pos"),
+                ]
         else:
             self.get_logger().warn("Body 'hand_palm' not found; palm teleop disabled")
 
@@ -173,6 +193,9 @@ class PlantRosNode(Node):
         self.pub_actuation_wrench_body = self.create_publisher(
             Wrench, "/minitrone/actuation_wrench_body", 10
         )
+        self.pub_cop_real = self.create_publisher(
+            CenterOfPressure, "/minitrone/cop_real", 10
+        )
         self.sub_palm_pose = self.create_subscription(
             Float64MultiArray, "/minitrone/palm_pose_cmd", self.on_palm_pose_cmd, 10
         )
@@ -203,7 +226,11 @@ class PlantRosNode(Node):
             self.last_external_wrench_cmd_wall_t = time.perf_counter()
 
     def on_palm_pose_cmd(self, msg: Float64MultiArray):
-        if self.palm_mocap_id < 0 or len(msg.data) < 6:
+        if self.palm_body_id < 0 or len(msg.data) < 6:
+            return
+        if self.palm_mocap_id < 0:
+            with self._lock:
+                self.palm_pose_cmd = np.array(msg.data[:6], dtype=float)
             return
         pos = np.array(msg.data[:3], dtype=float)
         quat = rpy_to_quat_wxyz(np.array(msg.data[3:6], dtype=float))
@@ -220,13 +247,34 @@ class PlantRosNode(Node):
         return x + np.random.normal(0.0, sigma, size=x.shape)
 
     def _publish_palm_pose(self):
-        if self.palm_mocap_id < 0:
+        if self.palm_body_id < 0:
             return
-        quat = np.array(self.data.mocap_quat[self.palm_mocap_id], dtype=float)
+        if self.palm_mocap_id >= 0:
+            pos = np.array(self.data.mocap_pos[self.palm_mocap_id], dtype=float)
+            quat = np.array(self.data.mocap_quat[self.palm_mocap_id], dtype=float)
+        else:
+            pos = np.array(self.data.xpos[self.palm_body_id], dtype=float)
+            quat = np.array(self.data.xquat[self.palm_body_id], dtype=float)
         rpy = quat_to_rpy(quat)
         msg = Float64MultiArray()
-        msg.data = np.concatenate((self.data.mocap_pos[self.palm_mocap_id], rpy)).tolist()
+        msg.data = np.concatenate((pos, rpy)).tolist()
         self.pub_palm_pose.publish(msg)
+
+    def _apply_palm_pose_cmd(self):
+        if self.palm_mocap_id >= 0 or not self.aid_palm or self.palm_pose_cmd is None:
+            return
+        rel_pos = np.asarray(self.palm_pose_cmd[:3], dtype=float) - self.palm_home_pos
+        rpy_cmd = np.asarray(self.palm_pose_cmd[3:6], dtype=float)
+        palm_ctrl = np.array([
+            rel_pos[0],
+            rel_pos[1],
+            rel_pos[2],
+            rpy_cmd[0],
+            rpy_cmd[1],
+            rpy_cmd[2],
+        ], dtype=float)
+        for actuator_id, ctrl in zip(self.aid_palm, palm_ctrl):
+            self.data.ctrl[actuator_id] = float(ctrl)
 
     def _delay_step(self) -> np.ndarray:
         self._delay_buf[self._delay_idx] = self.ctrl_recv
@@ -269,6 +317,50 @@ class PlantRosNode(Node):
         self.data.xfrc_applied[self.base_body_id, 0:3] = R_WB @ self.external_force_body
         self.data.xfrc_applied[self.base_body_id, 3:6] = R_WB @ self.external_moment_body
 
+    def _measured_corner_loads(self) -> np.ndarray:
+        """Distribute MuJoCo contact normal loads to four plate-corner load cells."""
+        loads = np.zeros(4, dtype=float)
+        base_pos = np.asarray(self.data.xpos[self.base_body_id], dtype=float)
+        r_bw = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3).T
+        contact_wrench = np.zeros(6, dtype=float)
+
+        for contact_index in range(self.data.ncon):
+            contact = self.data.contact[contact_index]
+            if (
+                contact.geom1 != self.contact_plate_geom_id
+                and contact.geom2 != self.contact_plate_geom_id
+            ):
+                continue
+            mujoco.mj_contactForce(self.model, self.data, contact_index, contact_wrench)
+            normal_load = max(0.0, float(contact_wrench[0]))
+            if normal_load <= 0.0:
+                continue
+
+            contact_body = r_bw @ (np.asarray(contact.pos, dtype=float) - base_pos)
+            y_unit = float(np.clip(contact_body[1] / self.cop_half_y, -1.0, 1.0))
+            z_unit = float(np.clip(contact_body[2] / self.cop_half_z, -1.0, 1.0))
+            loads += normal_load * 0.25 * np.array([
+                (1.0 + y_unit) * (1.0 + z_unit),
+                (1.0 - y_unit) * (1.0 + z_unit),
+                (1.0 - y_unit) * (1.0 - z_unit),
+                (1.0 + y_unit) * (1.0 - z_unit),
+            ])
+        return loads
+
+    def _publish_cop_real(self):
+        loads = self._measured_corner_loads()
+        normal_force = float(np.sum(loads))
+        msg = CenterOfPressure()
+        msg.normal_force = normal_force
+        msg.corner_forces = loads.tolist()
+        msg.valid = normal_force >= self.cop_force_min
+        if msg.valid:
+            corner_y = np.array([1.0, -1.0, -1.0, 1.0]) * self.cop_half_y
+            corner_z = np.array([1.0, 1.0, -1.0, -1.0]) * self.cop_half_z
+            msg.y = float(np.dot(loads, corner_y) / normal_force)
+            msg.z = float(np.dot(loads, corner_z) / normal_force)
+        self.pub_cop_real.publish(msg)
+
     # -------- Simulation loop --------
     def sim_loop(self):
         next_step = time.perf_counter()
@@ -291,6 +383,7 @@ class PlantRosNode(Node):
                 for i in range(4):
                     self.data.ctrl[self.aid_servo[i]] = float(u[4 + i])
 
+                self._apply_palm_pose_cmd()
                 self._apply_external_wrench()
 
                 # ---- step physics ----
@@ -362,6 +455,7 @@ class PlantRosNode(Node):
                     actuation_wrench_msg.force = actuation_force_B.astype(np.float32).tolist()
                     actuation_wrench_msg.moment = actuation_moment_B.astype(np.float32).tolist()
                     self.pub_actuation_wrench_body.publish(actuation_wrench_msg)
+                    self._publish_cop_real()
                     self._publish_palm_pose()
                     next_pub += 1.0 / PHYSICS_HZ
 

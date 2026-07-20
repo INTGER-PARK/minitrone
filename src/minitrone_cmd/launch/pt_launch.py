@@ -19,6 +19,13 @@ def generate_launch_description():
         output="screen"
     )
 
+    passive_aligning_controller = Node(
+        package="minitrone_controller",
+        executable="passive_aligning_controller",
+        name="minitrone_passive_aligning_controller",
+        output="screen"
+    )
+
     allocator_controller = Node(
         package="minitrone_controller",
         executable="minitrone_allocator_controller",
@@ -43,7 +50,12 @@ def generate_launch_description():
     start_controllers_after_plant = RegisterEventHandler(
         OnProcessStart(
             target_action=plant,
-            on_start=[wrench_controller, allocator_controller, ekf_state_estimator]
+            on_start=[
+                wrench_controller,
+                passive_aligning_controller,
+                allocator_controller,
+                ekf_state_estimator,
+            ]
         )
     )
 

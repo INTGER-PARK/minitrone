@@ -12,6 +12,7 @@ set(msg_files
   "msg/Cmd.msg"
   "msg/Wrench.msg"
   "msg/AttitudeCmd.msg"
+  "msg/CenterOfPressure.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

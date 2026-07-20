@@ -1,28 +1,53 @@
 <mujoco model="palm">
   <worldbody>
-    <body name="hand_palm" mocap="true" pos="1.4 0 1.0" quat="1 0 0 0">
-      <geom
-        name="hand_palm_vis"
-        type="box"
-        size="0.02 0.45 0.45"
-        mass="0"
-        rgba="0.85 0.72 0.58 0.7"
-        contype="0"
-        conaffinity="0"/>
-      <geom
-        name="hand_palm_col"
-        type="box"
-        size="0.02 0.45 0.45"
-        mass="0"
-        rgba="1 0 0 0.25"
-        contype="1"
-        conaffinity="1"
-        condim="6"
-        friction="1.2 0.03 0.01"
-        solref="-800 -80"
-        solimp="0.9 0.96 0.002"
-        margin="0.005"
-        group="5"/>
+    <body name="hand_palm_mount" pos="1.4 0 1.0" quat="1 0 0 0">
+      <joint name="hand_palm_slide_x" type="slide" axis="1 0 0" limited="true" range="-100.0 100.0" damping="80" />
+      <joint name="hand_palm_slide_y" type="slide" axis="0 1 0" limited="true" range="-100.0 100.0" damping="80" />
+      <joint name="hand_palm_slide_z" type="slide" axis="0 0 1" limited="true" range="-100.0 100.0" damping="80" />
+      <inertial pos="0 0 0" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
+      <body name="hand_palm_yaw_frame">
+        <joint name="hand_palm_yaw" type="hinge" axis="0 0 1" limited="true" range="-3.14159265359 3.14159265359" damping="20" />
+        <inertial pos="0 0 0" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
+        <body name="hand_palm_pitch_frame">
+          <joint name="hand_palm_pitch" type="hinge" axis="0 1 0" limited="true" range="-1.57079632679 1.57079632679" damping="20" />
+          <inertial pos="0 0 0" mass="1e-9" diaginertia="1e-12 1e-12 1e-12" />
+          <body name="hand_palm" pos="0 0 0">
+            <joint name="hand_palm_roll" type="hinge" axis="1 0 0" limited="true" range="-1.57079632679 1.57079632679" damping="20" />
+            <inertial pos="0 0 0" mass="5.0" diaginertia="0.675 0.338167 0.338167" />
+            <geom
+              name="hand_palm_vis"
+              type="box"
+              size="0.02 0.45 0.45"
+              mass="0"
+              rgba="0.85 0.72 0.58 0.7"
+              contype="0"
+              conaffinity="0"/>
+            <geom
+              name="hand_palm_col"
+              type="box"
+              size="0.02 0.45 0.45"
+              mass="0"
+              rgba="1 0 0 0.25"
+              contype="1"
+              conaffinity="1"
+              condim="6"
+              friction="1.2 0.03 0.01"
+              solref="-800 -80"
+              solimp="0.9 0.96 0.002"
+              margin="0.005"
+              group="5"/>
+          </body>
+        </body>
+      </body>
     </body>
   </worldbody>
+
+  <actuator>
+    <position name="hand_palm_slide_x_pos" joint="hand_palm_slide_x" kp="3000" kv="200" ctrlrange="-100.0 100.0" />
+    <position name="hand_palm_slide_y_pos" joint="hand_palm_slide_y" kp="3000" kv="200" ctrlrange="-100.0 100.0" />
+    <position name="hand_palm_slide_z_pos" joint="hand_palm_slide_z" kp="3000" kv="200" ctrlrange="-100.0 100.0" />
+    <position name="hand_palm_yaw_pos" joint="hand_palm_yaw" kp="800" kv="60" ctrlrange="-3.14159265359 3.14159265359" />
+    <position name="hand_palm_pitch_pos" joint="hand_palm_pitch" kp="800" kv="60" ctrlrange="-1.57079632679 1.57079632679" />
+    <position name="hand_palm_roll_pos" joint="hand_palm_roll" kp="800" kv="60" ctrlrange="-1.57079632679 1.57079632679" />
+  </actuator>
 </mujoco>

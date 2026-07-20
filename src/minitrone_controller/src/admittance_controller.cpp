@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include <minitrone_interfaces/msg/attitude_cmd.hpp>
 #include <minitrone_interfaces/msg/cmd.hpp>
@@ -8,18 +9,28 @@
 #include <std_msgs/msg/float64.hpp>
 
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <string>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
+#include <vector>
 
 namespace
 {
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kDegToRad = kPi / 180.0;
+constexpr double kRadToDeg = 180.0 / kPi;
+constexpr std::size_t kDof = 6;
+
+const std::array<std::string, kDof> kAxisNames = {
+  "x", "y", "z", "roll", "pitch", "yaw"};
 
 Eigen::Matrix3d rotationWorldFromBody(const Eigen::Vector3d & rpy)
 {
@@ -42,6 +53,44 @@ Eigen::Matrix3d rotationWorldFromBody(const Eigen::Vector3d & rpy)
   return r_wb;
 }
 
+Eigen::Matrix3d rotationExp(const Eigen::Vector3d & phi)
+{
+  const double angle = phi.norm();
+  if (angle < 1e-10) {
+    Eigen::Matrix3d hat;
+    hat <<
+      0.0, -phi.z(), phi.y(),
+      phi.z(), 0.0, -phi.x(),
+      -phi.y(), phi.x(), 0.0;
+    return Eigen::Matrix3d::Identity() + hat;
+  }
+  return Eigen::AngleAxisd(angle, phi / angle).toRotationMatrix();
+}
+
+Eigen::Vector3d rpyFromRotation(const Eigen::Matrix3d & r)
+{
+  // ZYX convention: R = Rz(yaw) * Ry(pitch) * Rx(roll)
+  const double pitch = std::asin(std::clamp(-r(2, 0), -1.0, 1.0));
+  const double cp = std::cos(pitch);
+
+  double roll = 0.0;
+  double yaw = 0.0;
+  if (std::abs(cp) > 1e-7) {
+    roll = std::atan2(r(2, 1), r(2, 2));
+    yaw = std::atan2(r(1, 0), r(0, 0));
+  } else {
+    // Near pitch = +-90 deg, choose roll = 0 and preserve a valid yaw.
+    roll = 0.0;
+    yaw = std::atan2(-r(0, 1), r(1, 1));
+  }
+  return Eigen::Vector3d(roll, pitch, yaw);
+}
+
+double unwrapNear(double angle, double reference)
+{
+  return reference + std::atan2(std::sin(angle - reference), std::cos(angle - reference));
+}
+
 double moveToward(double current, double target, double max_step)
 {
   const double step = std::max(0.0, max_step);
@@ -52,251 +101,172 @@ double moveToward(double current, double target, double max_step)
 }
 }  // namespace
 
-class AdmittanceController : public rclcpp::Node
+class AdmittanceController6Dof : public rclcpp::Node
 {
 public:
   enum class Mode
   {
-    NORMAL,
-    ADMITTANCE
+    PASSTHROUGH,
+    ADMITTANCE,
+    HOLD
   };
 
-  AdmittanceController()
-  : rclcpp::Node("minitrone_admittance_controller")
+  AdmittanceController6Dof()
+  : rclcpp::Node("minitrone_admittance_controller_6dof")
   {
-    // ========================================================================
-    // 1. 접촉면 방향 설정
-    // ========================================================================
-    // n_face_body = [n_face_b_x, n_face_b_y, n_face_b_z]^T
-    //
-    // 드론 BODY 좌표계에서 "접촉면을 향하는 방향"을 정의하는 단위벡터이다.
-    // admittance가 계산한 스칼라 변위 x_adm_delta_는 이 방향으로 위치 명령에
-    // 더해진다. 또한 외력 벡터를 이 방향에 투영하여 normal force를 계산한다.
-    //
-    // 예시:
-    //   드론 BODY +X 방향이 판을 향함 -> [1, 0, 0]
-    //   드론 BODY -X 방향이 판을 향함 -> [-1, 0, 0]
-    //   드론 BODY +Y 방향이 판을 향함 -> [0, 1, 0]
-    //
-    // 입력 벡터의 크기는 중요하지 않으며 아래에서 자동으로 normalize된다.
-    // 모든 성분이 거의 0이면 안전하게 BODY +X 방향으로 대체한다.
-    n_face_body_ << declare_parameter<double>("n_face_b_x", 1.0),
-                    declare_parameter<double>("n_face_b_y", 0.0),
-                    declare_parameter<double>("n_face_b_z", 0.0);
+    // ------------------------------------------------------------------------
+    // Global and per-axis enable settings
+    // ------------------------------------------------------------------------
+    const bool initially_enabled = declare_parameter<bool>("enabled", false);
+    for (std::size_t i = 0; i < kDof; ++i) {
+      axis_enabled_[i] = declare_parameter<bool>("enable_" + kAxisNames[i], true);
+    }
+
+    // Contact surface direction in BODY frame: robot -> contact surface.
+    n_face_body_ <<
+      declare_parameter<double>("n_face_b_x", 1.0),
+      declare_parameter<double>("n_face_b_y", 0.0),
+      declare_parameter<double>("n_face_b_z", 0.0);
     if (n_face_body_.norm() < 1e-6) {
       n_face_body_ = Eigen::Vector3d::UnitX();
     }
     n_face_body_.normalize();
 
-    // ========================================================================
-    // 2. 목표 접촉력 관련 파라미터
-    // ========================================================================
-
-    // f_normal_des [N]
-    // 최종적으로 유지하고 싶은 목표 normal force이다.
-    // 예: 5.0이면 판을 약 5 N으로 계속 누르도록 위치 reference를 이동시킨다.
-    // 값을 크게 하면 더 강하게 누르지만, 위치제어기 포화·기체 기울어짐·충격이
-    // 커질 수 있으므로 낮은 값부터 올리는 것이 안전하다.
+    // ------------------------------------------------------------------------
+    // Normal-force tracking
+    // ------------------------------------------------------------------------
     f_normal_des_ = declare_parameter<double>("f_normal_des", 5.0);
-
-    // f_normal_step [N/key]
-    // 키보드 U/J를 한 번 누를 때 f_normal_des를 증가/감소시키는 크기이다.
-    // U: +f_normal_step, J: -f_normal_step
-    // 제어 응답 자체에는 직접 들어가지 않고 사용자가 목표 힘을 조절할 때만 쓴다.
-    f_normal_step_ = declare_parameter<double>("f_normal_step", 0.1);
-
-    // f_normal_min [N]
-    // 사용자가 설정할 수 있는 목표 normal force의 하한이다.
-    // 보통 음의 normal force를 사용하지 않으므로 0 N으로 둔다.
+    f_normal_step_ = std::abs(declare_parameter<double>("f_normal_step", 0.1));
     f_normal_min_ = declare_parameter<double>("f_normal_min", 0.0);
-
-    // f_normal_max [N]
-    // 목표 normal force의 상한이다. U 키를 계속 눌러도 이 값을 넘지 않는다.
-    // 하드웨어와 위치제어기의 안전 한계보다 충분히 낮게 설정해야 한다.
     f_normal_max_ = declare_parameter<double>("f_normal_max", 20.0);
-
-    // f_ref_rate_max [N/s]
-    // 실제 admittance에 넣는 활성 목표 힘 f_normal_ref_active가
-    // f_normal_des까지 변하는 최대 속도이다.
-    //
-    // I를 눌러 mode를 켜거나 U/J로 목표 힘을 바꿔도 목표 힘이 계단처럼
-    // 즉시 바뀌지 않고 이 속도로 ramp된다.
-    //   작게 설정: 접촉력이 천천히 증가하여 부드럽지만 목표 도달이 느림
-    //   크게 설정: 목표 도달은 빠르지만 접촉 충격과 위치 reference 변화가 커짐
-    // 예: 1.0 N/s이면 0 N에서 5 N까지 약 5초가 걸린다.
-    f_ref_rate_max_ = declare_parameter<double>("f_ref_rate_max", 1.0);  // [N/s]
-
-    // ========================================================================
-    // 3. 외력 추정값 및 force error 처리
-    // ========================================================================
-
-    // force_lpf_cutoff_hz [Hz]
-    // 추정 normal force에 적용하는 1차 저역통과필터(LPF)의 차단주파수이다.
-    //   작게 설정: 노이즈와 순간 충격을 강하게 제거하지만 힘 응답이 느려짐
-    //   크게 설정: 실제 힘 변화를 빠르게 따라가지만 노이즈가 더 많이 통과함
-    //   0 이하: 필터를 사용하지 않고 raw force를 그대로 사용
-    // 너무 낮으면 접촉력이 늦게 반영되어 드론이 판 안쪽으로 더 밀고 들어갈 수 있다.
-    force_lpf_cutoff_hz_ = declare_parameter<double>("force_lpf_cutoff_hz", 5.0);
-
-    // force_error_deadband [N]
-    // |목표 힘 - 추정 힘|이 이 값 이하이면 force error를 0으로 처리한다.
-    // estimator 노이즈 때문에 위치 reference가 계속 미세하게 흔들리는 것을 막는다.
-    //   크게 설정: 정지 상태는 안정적이지만 정상상태 힘 오차가 커질 수 있음
-    //   작게 설정: 목표 힘을 정밀하게 추종하지만 채터링/미세 이동이 증가할 수 있음
-    force_error_deadband_ = declare_parameter<double>("force_error_deadband", 0.10);
-
-    // force_error_max [N]
-    // admittance model에 입력되는 force error의 절댓값 상한이다.
-    // 접촉이 순간적으로 사라져 추정 힘이 0이 되거나 estimator spike가 발생해도
-    // 지나치게 큰 가상 가속도가 발생하지 않도록 한다.
-    //   작게 설정: 접촉 복구가 부드럽지만 목표 힘 회복이 느림
-    //   크게 설정: 회복은 빠르지만 급가속·재충돌 가능성이 커짐
-    force_error_max_ = declare_parameter<double>("force_error_max", 1.50);
-
-    // ========================================================================
-    // 4. 선택적 force-error 적분항
-    // ========================================================================
-
-    // force_integral_gain
-    // 적분된 force error를 추가적인 등가 힘으로 바꾸는 gain이다.
-    // integral_force = force_integral_gain * integral(force_error dt)
-    //
-    // 판이 일정 속도로 움직이거나 모델 오차가 있을 때 남는 정상상태 force error를
-    // 줄일 수 있지만, 값을 너무 크게 하면 overshoot와 접촉 진동이 생길 수 있다.
-    // 기본 admittance 응답이 충분히 안정화되기 전에는 반드시 0.0을 권장한다.
-    // 단위는 구현상 [1/s]에 해당한다.
-    force_integral_gain_ = declare_parameter<double>("force_integral_gain", 0.0);
-
-    // force_integral_limit [N*s]
-    // force-error 적분 상태 force_error_integral_의 절댓값 상한이다.
-    // 접촉이 장시간 약하거나 변위가 포화되었을 때 적분값이 무한히 쌓이는
-    // integral windup을 제한한다.
-    // 실제 추가 힘의 최대치는 대략
-    //   force_integral_gain * force_integral_limit [N]
-    // 이다.
-    force_integral_limit_ = declare_parameter<double>("force_integral_limit", 1.0);
-
-    // ========================================================================
-    // 5. 가상 Mass-Spring-Damper admittance 파라미터
-    // ========================================================================
-    // 사용 식:
-    //   M*x_ddot + D*x_dot + K*x
-    //     = force_error + integral_force
-    //
-    // 여기서 x는 실제 드론 위치가 아니라 접촉 방향의 위치 reference 보정량
-    // x_adm_delta_이다. M, D, K는 실제 기체 물성치가 아니라 사용자가 원하는
-    // compliant motion을 만들기 위해 설정하는 "가상" 파라미터이다.
-
-    // adm_mass [kg에 대응하는 가상 질량]
-    // 같은 force error에 대해 reference 가속도가 얼마나 빠르게 변하는지 결정한다.
-    //   크게 설정: 무겁고 둔하게 반응, 접촉 충격 감소, 힘 회복 느림
-    //   작게 설정: 민감하고 빠르게 반응, 충격·진동 가능성 증가
-    // 실제 계산에서는 0으로 나누는 것을 막기 위해 최소 1e-6으로 제한한다.
-    adm_mass_ = declare_parameter<double>("adm_mass", 1.0);
-
-    // adm_damping [N*s/m에 대응하는 가상 감쇠]
-    // reference 속도 x_dot에 반대되는 힘 D*x_dot을 만든다.
-    //   크게 설정: 움직임이 느리고 안정적이며 진동이 줄어듦
-    //   작게 설정: 판의 움직임을 빠르게 따라가지만 overshoot/진동 가능성 증가
-    // K=0인 현재 설정에서는 일정한 force error에 대한 정상상태 reference 속도가
-    // 대략 x_dot = force_error / D가 된다.
-    adm_damping_ = declare_parameter<double>("adm_damping", 20.0);
-
-    // adm_stiffness [N/m에 대응하는 가상 강성]
-    // mode 진입 시 기준 위치에서 멀어질수록 원래 위치로 돌아가려는 항 K*x를 만든다.
-    //   0.0: 손으로 판을 움직이면 드론 reference가 계속 따라가고 새 위치에 남을 수 있음
-    //   >0 : 스프링처럼 기준 위치로 돌아가려는 성질이 생김
-    // 지속적인 접촉 추종이 목적이면 보통 0 또는 매우 작은 값부터 사용한다.
-    adm_stiffness_ = declare_parameter<double>("adm_stiffness", 0.0);
-
-    // ========================================================================
-    // 6. 생성되는 위치 reference의 안전 제한
-    // ========================================================================
-
-    // x_ddot_max [m/s^2]
-    // admittance 내부에서 생성되는 접촉 방향 reference 가속도의 절댓값 상한이다.
-    // force error가 커도 위치 reference 속도가 갑자기 증가하지 못하게 한다.
-    //   작게 설정: 접촉 복구가 매우 부드럽지만 느림
-    //   크게 설정: force error 회복이 빠르지만 '팍 튀는' 현상이 증가할 수 있음
-    x_ddot_max_ = declare_parameter<double>("x_ddot_max", 0.05);  // [m/s^2]
-
-    // x_dot_max [m/s]
-    // admittance 내부 접촉 방향 reference 속도의 절댓값 상한이다.
-    // 접촉이 완전히 사라져 force error가 계속 양수여도 이 속도 이상으로
-    // 판 방향을 향해 전진하지 않는다.
-    // 0.015 m/s는 15 mm/s이다.
-    x_dot_max_ = declare_parameter<double>("x_dot_max", 0.05);   // [m/s]
-
-    // x_delta_max [m]
-    // I를 눌러 admittance mode에 들어간 기준 위치로부터 접촉 방향으로 이동할 수 있는
-    // 최대 위치 보정량의 절댓값이다. +방향과 -방향에 동일하게 적용된다.
-    // 접촉 대상이 사라져도 드론이 무한히 이동하는 것을 막는 최종 안전 제한이다.
-    // 예: 0.12 m이면 mode 진입 기준점에서 최대 ±12 cm 이동 가능하다.
-    x_delta_max_ = declare_parameter<double>("x_delta_max", 5.0);  // [m]
-
-    // pos_ref_rate_max [m/s]
-    // 최종 publish되는 3차원 위치 reference 벡터 전체의 변화율 제한이다.
-    // x_dot_max는 admittance 내부의 1차원 접촉방향 속도 제한이고,
-    // pos_ref_rate_max는 그 결과를 publish하기 직전에 한 번 더 제한하는 보호층이다.
-    //
-    // 정상적으로는 pos_ref_rate_max >= x_dot_max로 두어 내부 admittance 동특성을
-    // 지나치게 왜곡하지 않는 것이 좋다. 더 작게 두면 최종 명령은 부드러워지지만
-    // 내부 x_adm_delta와 실제 publish reference 사이에 지연이 생긴다.
-    pos_ref_rate_max_ = declare_parameter<double>("pos_ref_rate_max", 0.05);  // [m/s]
+    f_ref_rate_max_ = std::abs(declare_parameter<double>("f_ref_rate_max", 1.0));
+    normal_force_integral_gain_ =
+      declare_parameter<double>("normal_force_integral_gain", 0.0);
+    normal_force_integral_limit_ = std::abs(
+      declare_parameter<double>("normal_force_integral_limit", 1.0));
 
     if (f_normal_min_ > f_normal_max_) {
       std::swap(f_normal_min_, f_normal_max_);
     }
-
-    f_normal_step_ = std::abs(f_normal_step_);
     f_normal_des_ = std::clamp(f_normal_des_, f_normal_min_, f_normal_max_);
 
+    // ------------------------------------------------------------------------
+    // Six-axis virtual M, D, K.
+    // First 3 axes: [m, m/s] related translational motion.
+    // Last 3 axes: [rad, rad/s] related rotational motion.
+    // ------------------------------------------------------------------------
+    const std::array<double, kDof> m_default = {1.0, 1.0, 1.0, 0.20, 0.20, 0.30};
+    const std::array<double, kDof> d_default = {20.0, 20.0, 20.0, 2.0, 2.0, 2.0};
+    const std::array<double, kDof> k_default = {0.0, 0.0, 0.0, 1.0, 1.0, 1.0};
+
+    for (std::size_t i = 0; i < kDof; ++i) {
+      adm_m_[i] = std::max(
+        std::abs(declare_parameter<double>("adm_m_" + kAxisNames[i], m_default[i])),
+        1e-6);
+      adm_d_[i] = std::max(
+        0.0, declare_parameter<double>("adm_d_" + kAxisNames[i], d_default[i]));
+      adm_k_[i] = std::max(
+        0.0, declare_parameter<double>("adm_k_" + kAxisNames[i], k_default[i]));
+    }
+
+    // ------------------------------------------------------------------------
+    // Independent LPF cutoff frequency for Fx,Fy,Fz,Mx,My,Mz.
+    // ------------------------------------------------------------------------
+    for (std::size_t i = 0; i < kDof; ++i) {
+      cutoff_hz_[i] = std::max(
+        0.0, declare_parameter<double>("cutoff_" + kAxisNames[i] + "_hz", 10.0));
+    }
+
+    // Input deadband and saturation.
+    const std::array<double, kDof> deadband_default = {
+      0.05, 0.05, 0.05, 0.01, 0.01, 0.01};
+    const std::array<double, kDof> input_max_default = {
+      2.0, 2.0, 2.0, 0.50, 0.50, 0.50};
+
+    // Virtual acceleration, velocity, and displacement limits.
+    const std::array<double, kDof> ddq_max_default = {
+      0.10, 0.10, 0.10,
+      30.0 * kDegToRad, 30.0 * kDegToRad, 30.0 * kDegToRad};
+    const std::array<double, kDof> dq_max_default = {
+      0.05, 0.05, 0.05,
+      10.0 * kDegToRad, 10.0 * kDegToRad, 10.0 * kDegToRad};
+    const std::array<double, kDof> q_max_default = {
+      0.15, 0.15, 0.15,
+      10.0 * kDegToRad, 10.0 * kDegToRad, 15.0 * kDegToRad};
+
+    for (std::size_t i = 0; i < kDof; ++i) {
+      input_deadband_[i] = std::abs(declare_parameter<double>(
+        "input_deadband_" + kAxisNames[i], deadband_default[i]));
+      input_max_[i] = std::abs(declare_parameter<double>(
+        "input_max_" + kAxisNames[i], input_max_default[i]));
+      ddq_max_[i] = std::abs(declare_parameter<double>(
+        "ddq_max_" + kAxisNames[i], ddq_max_default[i]));
+      dq_max_[i] = std::abs(declare_parameter<double>(
+        "dq_max_" + kAxisNames[i], dq_max_default[i]));
+      q_max_[i] = std::abs(declare_parameter<double>(
+        "q_max_" + kAxisNames[i], q_max_default[i]));
+    }
+
+    wrench_timeout_sec_ = std::max(
+      0.0, declare_parameter<double>("wrench_timeout_sec", 0.10));
+
+    // ------------------------------------------------------------------------
+    // ROS I/O
+    // ------------------------------------------------------------------------
     sub_cmd_ = create_subscription<minitrone_interfaces::msg::Cmd>(
       "/minitrone/cmd", 10,
-      std::bind(&AdmittanceController::onCmd, this, std::placeholders::_1));
+      std::bind(&AdmittanceController6Dof::onCmd, this, std::placeholders::_1));
 
     sub_att_cmd_ = create_subscription<minitrone_interfaces::msg::AttitudeCmd>(
       "/minitrone/att_cmd", 10,
-      std::bind(&AdmittanceController::onAttCmd, this, std::placeholders::_1));
+      std::bind(&AdmittanceController6Dof::onAttCmd, this, std::placeholders::_1));
 
     sub_state_ = create_subscription<minitrone_interfaces::msg::MinitroneState>(
       "/minitrone/state", 10,
-      std::bind(&AdmittanceController::onState, this, std::placeholders::_1));
+      std::bind(&AdmittanceController6Dof::onState, this, std::placeholders::_1));
 
     sub_external_wrench_ = create_subscription<minitrone_interfaces::msg::Wrench>(
       "/minitrone/external_wrench_hat_second_order", 10,
-      std::bind(&AdmittanceController::onExternalWrench, this, std::placeholders::_1));
+      std::bind(
+        &AdmittanceController6Dof::onExternalWrench, this, std::placeholders::_1));
 
-    pub_cmd_ =
-      create_publisher<minitrone_interfaces::msg::Cmd>("/minitrone/cmd_admittance", 10);
+    // true: enter 6-DOF admittance, false: hold current measured pose.
+    sub_enable_ = create_subscription<std_msgs::msg::Bool>(
+      "/minitrone/admittance_enable", 10,
+      std::bind(&AdmittanceController6Dof::onEnable, this, std::placeholders::_1));
+
+    pub_cmd_ = create_publisher<minitrone_interfaces::msg::Cmd>(
+      "/minitrone/cmd_admittance", 10);
     pub_att_cmd_ = create_publisher<minitrone_interfaces::msg::AttitudeCmd>(
       "/minitrone/att_cmd_admittance", 10);
-    pub_admittance_active_ =
-      create_publisher<std_msgs::msg::Bool>("/minitrone/admittance_active", 10);
-    pub_admittance_des_force_ =
-      create_publisher<std_msgs::msg::Float64>("/minitrone/admittance_des_force", 10);
+    pub_active_ = create_publisher<std_msgs::msg::Bool>(
+      "/minitrone/admittance_active", 10);
+    pub_des_force_ = create_publisher<std_msgs::msg::Float64>(
+      "/minitrone/admittance_des_force", 10);
+
+    parameter_callback_handle_ = add_on_set_parameters_callback(
+      std::bind(
+        &AdmittanceController6Dof::onSetParameters,
+        this,
+        std::placeholders::_1));
 
     setupKeyboard();
     keyboard_timer_ = create_wall_timer(
       std::chrono::milliseconds(20),
-      std::bind(&AdmittanceController::pollKeyboard, this));
+      std::bind(&AdmittanceController6Dof::pollKeyboard, this));
 
-    last_time_ = now();
-    publishAdmittanceActive();
-    publishAdmittanceDesiredForce();
+    last_control_time_ = now();
+    pending_enable_ = initially_enabled;
+    publishStatus();
 
     RCLCPP_INFO(
       get_logger(),
-      "Keyboard: I=toggle admittance, "
-      "U=desired force +%.2f N, "
-      "J=desired force -%.2f N "
-      "(current %.2f N)",
-      f_normal_step_,
-      f_normal_step_,
-      f_normal_des_);
+      "6-DOF admittance ready. I=toggle admittance/HOLD, "
+      "P=PASSTHROUGH, U/J=normal force +/- %.2f N",
+      f_normal_step_);
   }
 
-  ~AdmittanceController() override
+  ~AdmittanceController6Dof() override
   {
     restoreKeyboard();
   }
@@ -304,156 +274,484 @@ public:
 private:
   void onCmd(const minitrone_interfaces::msg::Cmd::SharedPtr msg)
   {
-    pos_cmd_ << static_cast<double>(msg->pos_cmd[0]),
-                static_cast<double>(msg->pos_cmd[1]),
-                static_cast<double>(msg->pos_cmd[2]);
+    upstream_pos_cmd_ <<
+      static_cast<double>(msg->pos_cmd[0]),
+      static_cast<double>(msg->pos_cmd[1]),
+      static_cast<double>(msg->pos_cmd[2]);
     have_cmd_ = true;
   }
 
   void onAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
   {
-    att_cmd_msg_ = *msg;
+    upstream_att_cmd_rad_ <<
+      static_cast<double>(msg->roll_ref) * kDegToRad,
+      static_cast<double>(msg->pitch_ref) * kDegToRad,
+      static_cast<double>(msg->yaw_ref) * kDegToRad;
     have_att_cmd_ = true;
   }
 
   void onExternalWrench(const minitrone_interfaces::msg::Wrench::SharedPtr msg)
   {
-    external_force_body_ << static_cast<double>(msg->force[0]),
-                            static_cast<double>(msg->force[1]),
-                            static_cast<double>(msg->force[2]);
+    external_force_body_ <<
+      static_cast<double>(msg->force[0]),
+      static_cast<double>(msg->force[1]),
+      static_cast<double>(msg->force[2]);
+    external_moment_body_ <<
+      static_cast<double>(msg->moment[0]),
+      static_cast<double>(msg->moment[1]),
+      static_cast<double>(msg->moment[2]);
     have_external_wrench_ = true;
+    last_wrench_time_ = now();
   }
 
-  void resetAdmittanceState()
+  void onEnable(const std_msgs::msg::Bool::SharedPtr msg)
   {
-    x_adm_delta_ = 0.0;
-    x_adm_dot_ = 0.0;
-    force_error_integral_ = 0.0;
-    f_normal_ref_active_ = 0.0;
+    requestEnabled(msg->data);
   }
 
-  void enterAdmittanceMode(const Eigen::Vector3d & n_face_world)
+  void requestEnabled(bool enabled)
   {
-    mode_ = Mode::ADMITTANCE;
-
-    // Keep the contact direction fixed in the world frame during one admittance
-    // episode. This is appropriate for contact with a fixed plate/wall and avoids
-    // reference rotation caused by small attitude changes.
-    n_contact_world_ = n_face_world;
-    if (n_contact_world_.norm() < 1e-6) {
-      n_contact_world_ = Eigen::Vector3d::UnitX();
+    const auto result = set_parameter(rclcpp::Parameter("enabled", enabled));
+    if (!result.successful) {
+      RCLCPP_ERROR(
+        get_logger(), "failed to set enabled=%s: %s",
+        enabled ? "true" : "false", result.reason.c_str());
     }
-    n_contact_world_.normalize();
+  }
 
-    // Bumpless mode entry: start at the last position reference that was actually
-    // published instead of jumping to a separate approach/contact reference.
-    p_admittance_base_world_ = pos_ref_initialized_ ? last_pos_ref_world_ : pos_;
+  rcl_interfaces::msg::SetParametersResult onSetParameters(
+    const std::vector<rclcpp::Parameter> & parameters)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
 
-    x_adm_delta_ = 0.0;
-    x_adm_dot_ = 0.0;
-    force_error_integral_ = 0.0;
+    for (const auto & parameter : parameters) {
+      const std::string & name = parameter.get_name();
+      if (name == "enabled") {
+        setEnabledInternal(parameter.as_bool());
+        continue;
+      }
+      if (name == "f_normal_des") {
+        f_normal_des_ = std::clamp(
+          parameter.as_double(), f_normal_min_, f_normal_max_);
+        continue;
+      }
+      if (name == "f_ref_rate_max") {
+        f_ref_rate_max_ = std::abs(parameter.as_double());
+        continue;
+      }
+      if (name == "normal_force_integral_gain") {
+        normal_force_integral_gain_ = parameter.as_double();
+        continue;
+      }
 
-    // Begin from the currently estimated force and ramp toward the desired force.
+      for (std::size_t i = 0; i < kDof; ++i) {
+        if (name == "enable_" + kAxisNames[i]) {
+          axis_enabled_[i] = parameter.as_bool();
+          if (!axis_enabled_[i]) {
+            q_[i] = 0.0;
+            dq_[i] = 0.0;
+          }
+        } else if (name == "adm_m_" + kAxisNames[i]) {
+          adm_m_[i] = std::max(std::abs(parameter.as_double()), 1e-6);
+        } else if (name == "adm_d_" + kAxisNames[i]) {
+          adm_d_[i] = std::max(0.0, parameter.as_double());
+        } else if (name == "adm_k_" + kAxisNames[i]) {
+          adm_k_[i] = std::max(0.0, parameter.as_double());
+        } else if (name == "cutoff_" + kAxisNames[i] + "_hz") {
+          cutoff_hz_[i] = std::max(0.0, parameter.as_double());
+        } else if (name == "input_deadband_" + kAxisNames[i]) {
+          input_deadband_[i] = std::abs(parameter.as_double());
+        } else if (name == "input_max_" + kAxisNames[i]) {
+          input_max_[i] = std::abs(parameter.as_double());
+        } else if (name == "ddq_max_" + kAxisNames[i]) {
+          ddq_max_[i] = std::abs(parameter.as_double());
+        } else if (name == "dq_max_" + kAxisNames[i]) {
+          dq_max_[i] = std::abs(parameter.as_double());
+        } else if (name == "q_max_" + kAxisNames[i]) {
+          q_max_[i] = std::abs(parameter.as_double());
+        }
+      }
+    }
+    return result;
+  }
+
+  void onState(const minitrone_interfaces::msg::MinitroneState::SharedPtr msg)
+  {
+    pos_ <<
+      static_cast<double>(msg->pos[0]),
+      static_cast<double>(msg->pos[1]),
+      static_cast<double>(msg->pos[2]);
+    vel_ <<
+      static_cast<double>(msg->vel[0]),
+      static_cast<double>(msg->vel[1]),
+      static_cast<double>(msg->vel[2]);
+    rpy_ <<
+      static_cast<double>(msg->rpy[0]),
+      static_cast<double>(msg->rpy[1]),
+      static_cast<double>(msg->rpy[2]);
+    w_body_ <<
+      static_cast<double>(msg->w_rpy[0]),
+      static_cast<double>(msg->w_rpy[1]),
+      static_cast<double>(msg->w_rpy[2]);
+    have_state_ = true;
+
+    if (pending_enable_) {
+      pending_enable_ = false;
+      enterAdmittanceMode();
+    }
+    if (mode_ == Mode::HOLD && !hold_initialized_) {
+      captureCurrentHoldPose();
+    }
+
+    updateAndPublish();
+  }
+
+  void setEnabledInternal(bool enabled)
+  {
+    if (enabled && mode_ == Mode::ADMITTANCE && !pending_enable_) {
+      return;
+    }
+    if (!enabled && mode_ == Mode::HOLD && !pending_enable_) {
+      return;
+    }
+
+    if (enabled) {
+      if (!have_state_) {
+        pending_enable_ = true;
+        RCLCPP_WARN(get_logger(), "admittance requested; waiting for state");
+        return;
+      }
+      enterAdmittanceMode();
+    } else {
+      pending_enable_ = false;
+      enterHoldMode();
+    }
+    publishStatus();
+  }
+
+  void enterAdmittanceMode()
+  {
+    if (!have_state_) {
+      pending_enable_ = true;
+      return;
+    }
+
+    mode_ = Mode::ADMITTANCE;
+    const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
+
+    // A frame is frozen in WORLD at mode entry and initially aligned with BODY.
+    r_wa_ = r_wb;
+    n_contact_a_ = n_face_body_;
+
+    base_pos_world_ = output_initialized_ ? last_pos_ref_world_ : pos_;
+    base_rotation_world_ = output_initialized_ ?
+      rotationWorldFromBody(last_att_ref_rad_) : r_wb;
+
+    q_.setZero();
+    dq_.setZero();
+    wrench_filter_initialized_ = false;
+    normal_force_integral_ = 0.0;
+
+    const Eigen::Matrix<double, 6, 1> wrench_a = rawWrenchInA(r_wb);
+    const double current_normal_force = std::max(
+      0.0, -n_contact_a_.dot(wrench_a.head<3>()));
     f_normal_ref_active_ = std::clamp(
-      f_normal_hat_,
+      current_normal_force,
       f_normal_min_,
       f_normal_des_);
 
     RCLCPP_INFO(
       get_logger(),
-      "admittance mode ON: continuous force control, F_raw=%.3f N, F_lpf=%.3f N",
-      f_normal_raw_,
-      f_normal_hat_);
+      "ADMITTANCE ON: normal force %.3f N -> desired %.3f N",
+      current_normal_force,
+      f_normal_des_);
   }
 
-  void setAdmittanceArmed(bool armed)
+  void captureCurrentHoldPose()
   {
-    if (admittance_armed_ == armed) {
+    hold_pos_world_ = pos_;
+    hold_att_rad_ = rpy_;
+    if (output_initialized_) {
+      hold_att_rad_.z() = unwrapNear(hold_att_rad_.z(), last_att_ref_rad_.z());
+    }
+    hold_initialized_ = true;
+  }
+
+  void enterHoldMode()
+  {
+    mode_ = Mode::HOLD;
+    hold_initialized_ = false;
+    if (!have_state_) {
       return;
     }
 
-    admittance_armed_ = armed;
+    // Requirement: when admittance is disabled, the lower position/attitude
+    // controller receives the pose measured at that exact moment, not an old
+    // upstream reference.
+    captureCurrentHoldPose();
 
-    if (admittance_armed_) {
-      if (have_state_) {
-        const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
-        enterAdmittanceMode(r_wb * n_face_body_);
-      } else {
-        mode_ = Mode::NORMAL;
-        resetAdmittanceState();
-        RCLCPP_INFO(get_logger(), "admittance mode requested; waiting for state");
-      }
-    } else {
-      mode_ = Mode::NORMAL;
-      resetAdmittanceState();
-      RCLCPP_INFO(get_logger(), "admittance mode OFF: NORMAL");
+    q_.setZero();
+    dq_.setZero();
+    normal_force_integral_ = 0.0;
+
+    RCLCPP_INFO(
+      get_logger(),
+      "ADMITTANCE OFF -> HOLD at p=[%.3f %.3f %.3f], rpy=[%.2f %.2f %.2f] deg",
+      hold_pos_world_.x(), hold_pos_world_.y(), hold_pos_world_.z(),
+      hold_att_rad_.x() * kRadToDeg,
+      hold_att_rad_.y() * kRadToDeg,
+      hold_att_rad_.z() * kRadToDeg);
+  }
+
+  void enterPassthroughMode()
+  {
+    mode_ = Mode::PASSTHROUGH;
+    pending_enable_ = false;
+    q_.setZero();
+    dq_.setZero();
+    normal_force_integral_ = 0.0;
+    RCLCPP_INFO(get_logger(), "PASSTHROUGH mode");
+    publishStatus();
+  }
+
+  bool wrenchIsFresh(const rclcpp::Time & t_now) const
+  {
+    if (!have_external_wrench_) {
+      return false;
+    }
+    if (wrench_timeout_sec_ <= 0.0) {
+      return true;
+    }
+    return (t_now - last_wrench_time_).seconds() <= wrench_timeout_sec_;
+  }
+
+  Eigen::Matrix<double, 6, 1> rawWrenchInA(const Eigen::Matrix3d & r_wb) const
+  {
+    Eigen::Matrix<double, 6, 1> wrench_a;
+    const Eigen::Matrix3d r_ab = r_wa_.transpose() * r_wb;
+    wrench_a.head<3>() = r_ab * external_force_body_;
+    wrench_a.tail<3>() = r_ab * external_moment_body_;
+    return wrench_a;
+  }
+
+  void updateFilteredWrench(double dt, const Eigen::Matrix3d & r_wb)
+  {
+    const Eigen::Matrix<double, 6, 1> raw = rawWrenchInA(r_wb);
+    if (!wrench_filter_initialized_) {
+      wrench_filtered_a_ = raw;
+      wrench_filter_initialized_ = true;
+      return;
     }
 
-    publishAdmittanceActive();
+    for (std::size_t i = 0; i < kDof; ++i) {
+      if (cutoff_hz_[i] <= 0.0) {
+        wrench_filtered_a_[i] = raw[i];
+        continue;
+      }
+      const double alpha = 1.0 - std::exp(-2.0 * kPi * cutoff_hz_[i] * dt);
+      wrench_filtered_a_[i] +=
+        std::clamp(alpha, 0.0, 1.0) * (raw[i] - wrench_filtered_a_[i]);
+    }
   }
 
-  void publishAdmittanceActive()
+  Eigen::Matrix<double, 6, 1> computeAdmittanceInput(double dt)
   {
-    std_msgs::msg::Bool msg;
-    msg.data = admittance_armed_;
-    pub_admittance_active_->publish(msg);
+    // External wrench convention:
+    //   measured wrench = environment acting on robot.
+    // Desired environment force for positive compression is -Fdes*n.
+    // Therefore measured - desired gives +(Fdes-Fnormal)*n on the normal axis.
+    Eigen::Matrix<double, 6, 1> desired_external_wrench_a =
+      Eigen::Matrix<double, 6, 1>::Zero();
+    desired_external_wrench_a.head<3>() =
+      -f_normal_ref_active_ * n_contact_a_;
+
+    Eigen::Matrix<double, 6, 1> input =
+      wrench_filtered_a_ - desired_external_wrench_a;
+
+    const double f_normal_hat = std::max(
+      0.0, -n_contact_a_.dot(wrench_filtered_a_.head<3>()));
+    const double normal_error = f_normal_ref_active_ - f_normal_hat;
+
+    normal_force_integral_ += normal_error * dt;
+    normal_force_integral_ = std::clamp(
+      normal_force_integral_,
+      -normal_force_integral_limit_,
+      normal_force_integral_limit_);
+    input.head<3>() +=
+      normal_force_integral_gain_ * normal_force_integral_ * n_contact_a_;
+
+    for (std::size_t i = 0; i < kDof; ++i) {
+      if (!axis_enabled_[i]) {
+        input[i] = 0.0;
+        q_[i] = 0.0;
+        dq_[i] = 0.0;
+        continue;
+      }
+      if (std::abs(input[i]) <= input_deadband_[i]) {
+        input[i] = 0.0;
+      }
+      input[i] = std::clamp(input[i], -input_max_[i], input_max_[i]);
+    }
+    return input;
   }
 
-  void publishAdmittanceDesiredForce()
+  void integrateAdmittance(const Eigen::Matrix<double, 6, 1> & input, double dt)
   {
-    std_msgs::msg::Float64 msg;
-    msg.data = f_normal_des_;
-    pub_admittance_des_force_->publish(msg);
+    for (std::size_t i = 0; i < kDof; ++i) {
+      if (!axis_enabled_[i]) {
+        q_[i] = 0.0;
+        dq_[i] = 0.0;
+        continue;
+      }
+
+      double ddq =
+        (input[i] - adm_d_[i] * dq_[i] - adm_k_[i] * q_[i]) / adm_m_[i];
+      ddq = std::clamp(ddq, -ddq_max_[i], ddq_max_[i]);
+
+      dq_[i] += ddq * dt;
+      dq_[i] = std::clamp(dq_[i], -dq_max_[i], dq_max_[i]);
+
+      q_[i] += dq_[i] * dt;
+      if (q_[i] >= q_max_[i]) {
+        q_[i] = q_max_[i];
+        if (dq_[i] > 0.0) {
+          dq_[i] = 0.0;
+        }
+      } else if (q_[i] <= -q_max_[i]) {
+        q_[i] = -q_max_[i];
+        if (dq_[i] < 0.0) {
+          dq_[i] = 0.0;
+        }
+      }
+    }
   }
 
-  void toggleAdmittance()
+  void computeOutputReference(
+    Eigen::Vector3d & pos_ref_world,
+    Eigen::Vector3d & att_ref_rad) const
   {
-    setAdmittanceArmed(!admittance_armed_);
+    if (mode_ == Mode::PASSTHROUGH) {
+      pos_ref_world = have_cmd_ ? upstream_pos_cmd_ : pos_;
+      att_ref_rad = have_att_cmd_ ? upstream_att_cmd_rad_ : rpy_;
+      return;
+    }
+
+    if (mode_ == Mode::HOLD) {
+      pos_ref_world = hold_initialized_ ? hold_pos_world_ : pos_;
+      att_ref_rad = hold_initialized_ ? hold_att_rad_ : rpy_;
+      return;
+    }
+
+    const Eigen::Vector3d delta_position_a = q_.head<3>();
+    const Eigen::Vector3d delta_rotation_a = q_.tail<3>();
+
+    pos_ref_world = base_pos_world_ + r_wa_ * delta_position_a;
+
+    // The virtual angular displacement is expressed in A. Convert it to WORLD
+    // and left-compose it with the base command orientation.
+    const Eigen::Vector3d delta_rotation_world = r_wa_ * delta_rotation_a;
+    const Eigen::Matrix3d r_ref =
+      rotationExp(delta_rotation_world) * base_rotation_world_;
+    att_ref_rad = rpyFromRotation(r_ref);
+
+    if (output_initialized_) {
+      att_ref_rad.x() = unwrapNear(att_ref_rad.x(), last_att_ref_rad_.x());
+      att_ref_rad.y() = unwrapNear(att_ref_rad.y(), last_att_ref_rad_.y());
+      att_ref_rad.z() = unwrapNear(att_ref_rad.z(), last_att_ref_rad_.z());
+    }
+  }
+
+  void updateAndPublish()
+  {
+    const rclcpp::Time t_now = now();
+    double dt = (t_now - last_control_time_).seconds();
+    last_control_time_ = t_now;
+    if (!(dt > 0.0) || dt > 0.2) {
+      dt = 1.0 / 400.0;
+    }
+
+    if (mode_ == Mode::ADMITTANCE) {
+      f_normal_ref_active_ = moveToward(
+        f_normal_ref_active_,
+        f_normal_des_,
+        f_ref_rate_max_ * dt);
+
+      if (wrenchIsFresh(t_now)) {
+        const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
+        updateFilteredWrench(dt, r_wb);
+        const Eigen::Matrix<double, 6, 1> input = computeAdmittanceInput(dt);
+        integrateAdmittance(input, dt);
+      } else {
+        // Never interpret a stale/missing estimator value as zero contact force.
+        // Freeze the virtual velocity instead of driving toward the wall.
+        dq_.setZero();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "external wrench missing/stale: admittance state frozen");
+      }
+    }
+
+    Eigen::Vector3d pos_ref_world;
+    Eigen::Vector3d att_ref_rad;
+    computeOutputReference(pos_ref_world, att_ref_rad);
+
+    minitrone_interfaces::msg::Cmd cmd_msg;
+    cmd_msg.pos_cmd[0] = static_cast<float>(pos_ref_world.x());
+    cmd_msg.pos_cmd[1] = static_cast<float>(pos_ref_world.y());
+    cmd_msg.pos_cmd[2] = static_cast<float>(pos_ref_world.z());
+
+    minitrone_interfaces::msg::AttitudeCmd att_msg;
+    att_msg.roll_ref = static_cast<float>(att_ref_rad.x() * kRadToDeg);
+    att_msg.pitch_ref = static_cast<float>(att_ref_rad.y() * kRadToDeg);
+    att_msg.yaw_ref = static_cast<float>(att_ref_rad.z() * kRadToDeg);
+
+    pub_cmd_->publish(cmd_msg);
+    pub_att_cmd_->publish(att_msg);
+
+    last_pos_ref_world_ = pos_ref_world;
+    last_att_ref_rad_ = att_ref_rad;
+    output_initialized_ = true;
+    publishStatus();
+  }
+
+  void publishStatus()
+  {
+    std_msgs::msg::Bool active_msg;
+    active_msg.data = mode_ == Mode::ADMITTANCE;
+    pub_active_->publish(active_msg);
+
+    std_msgs::msg::Float64 force_msg;
+    force_msg.data = f_normal_des_;
+    pub_des_force_->publish(force_msg);
   }
 
   void adjustDesiredForce(double delta)
   {
     const double old_force = f_normal_des_;
-
     f_normal_des_ = std::clamp(
       f_normal_des_ + delta,
       f_normal_min_,
       f_normal_max_);
-
-    if (std::abs(f_normal_des_ - old_force) > 1e-12) {
-      RCLCPP_INFO(
-        get_logger(),
-        "desired normal force: %.2f -> %.2f N "
-        "(filtered force: %.2f N, active reference: %.2f N)",
-        old_force,
-        f_normal_des_,
-        f_normal_hat_,
-        f_normal_ref_active_);
-    } else {
-      RCLCPP_WARN(
-        get_logger(),
-        "desired normal force remains %.2f N "
-        "(limit [%.2f, %.2f] N)",
-        f_normal_des_,
-        f_normal_min_,
-        f_normal_max_);
-    }
-    publishAdmittanceDesiredForce();
+    RCLCPP_INFO(
+      get_logger(),
+      "desired normal force %.2f -> %.2f N",
+      old_force,
+      f_normal_des_);
+    publishStatus();
   }
 
   void setupKeyboard()
   {
     keyboard_enabled_ = isatty(STDIN_FILENO);
     if (!keyboard_enabled_) {
-      RCLCPP_WARN(
-        get_logger(),
-        "stdin is not a TTY; keyboard controls disabled. Run this node in a terminal.");
+      RCLCPP_WARN(get_logger(), "stdin is not a TTY; keyboard disabled");
       return;
     }
 
     if (tcgetattr(STDIN_FILENO, &old_termios_) != 0) {
       keyboard_enabled_ = false;
-      RCLCPP_WARN(get_logger(), "failed to read terminal settings; keyboard controls disabled");
+      RCLCPP_WARN(get_logger(), "failed to read terminal settings");
       return;
     }
 
@@ -463,10 +761,9 @@ private:
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
       keyboard_enabled_ = false;
-      RCLCPP_WARN(get_logger(), "failed to set terminal raw mode; keyboard controls disabled");
+      RCLCPP_WARN(get_logger(), "failed to set terminal raw mode");
       return;
     }
-
     termios_configured_ = true;
   }
 
@@ -487,9 +784,7 @@ private:
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(STDIN_FILENO, &read_fds);
-    timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 0;
+    timeval timeout{0, 0};
 
     const int ready = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
     if (ready <= 0 || !FD_ISSET(STDIN_FILENO, &read_fds)) {
@@ -502,7 +797,10 @@ private:
     }
 
     if (key == 'I' || key == 'i') {
-      toggleAdmittance();
+      requestEnabled(mode_ != Mode::ADMITTANCE);
+    } else if (key == 'P' || key == 'p') {
+      requestEnabled(false);
+      enterPassthroughMode();
     } else if (key == 'U' || key == 'u') {
       adjustDesiredForce(+f_normal_step_);
     } else if (key == 'J' || key == 'j') {
@@ -510,299 +808,84 @@ private:
     }
   }
 
-  void onState(const minitrone_interfaces::msg::MinitroneState::SharedPtr msg)
-  {
-    pos_ << static_cast<double>(msg->pos[0]),
-            static_cast<double>(msg->pos[1]),
-            static_cast<double>(msg->pos[2]);
-    vel_ << static_cast<double>(msg->vel[0]),
-            static_cast<double>(msg->vel[1]),
-            static_cast<double>(msg->vel[2]);
-    rpy_ << static_cast<double>(msg->rpy[0]),
-            static_cast<double>(msg->rpy[1]),
-            static_cast<double>(msg->rpy[2]);
-    w_body_ << static_cast<double>(msg->w_rpy[0]),
-               static_cast<double>(msg->w_rpy[1]),
-               static_cast<double>(msg->w_rpy[2]);
-
-    have_state_ = true;
-    publishModifiedCommands();
-  }
-
-  Eigen::Vector3d limitPositionReference(
-    const Eigen::Vector3d & target,
-    double dt)
-  {
-    if (!pos_ref_initialized_) {
-      last_pos_ref_world_ = target;
-      pos_ref_initialized_ = true;
-      return target;
-    }
-
-    // Do not alter the ordinary position command while admittance is disabled.
-    if (!admittance_armed_) {
-      last_pos_ref_world_ = target;
-      return target;
-    }
-
-    const Eigen::Vector3d delta = target - last_pos_ref_world_;
-    const double max_step = std::max(0.0, pos_ref_rate_max_) * dt;
-
-    Eigen::Vector3d limited = target;
-    if (max_step > 0.0 && delta.norm() > max_step) {
-      limited = last_pos_ref_world_ + max_step * delta.normalized();
-    }
-
-    last_pos_ref_world_ = limited;
-    return limited;
-  }
-
-  void publishModifiedCommands()
-  {
-    const rclcpp::Time t_now = now();
-    double dt = (t_now - last_time_).seconds();
-    last_time_ = t_now;
-    if (!(dt > 0.0) || dt > 0.2) {
-      dt = 1.0 / 400.0;
-    }
-
-    const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
-    const Eigen::Vector3d n_face_world = r_wb * n_face_body_;
-
-    // The force estimator is updated on every state callback. While admittance
-    // mode is active, use the world-fixed contact direction selected at mode entry.
-    const Eigen::Vector3d & force_normal_world =
-      (admittance_armed_ && mode_ == Mode::ADMITTANCE) ? n_contact_world_ : n_face_world;
-    updateNormalForce(dt, r_wb, force_normal_world);
-
-    const Eigen::Vector3d pos_ref_target = computePositionReference(dt, n_face_world);
-    const Eigen::Vector3d pos_ref = limitPositionReference(pos_ref_target, dt);
-
-    minitrone_interfaces::msg::Cmd cmd_msg;
-    cmd_msg.pos_cmd[0] = static_cast<float>(pos_ref.x());
-    cmd_msg.pos_cmd[1] = static_cast<float>(pos_ref.y());
-    cmd_msg.pos_cmd[2] = static_cast<float>(pos_ref.z());
-
-    pub_cmd_->publish(cmd_msg);
-    pub_att_cmd_->publish(
-      have_att_cmd_ ? att_cmd_msg_ : minitrone_interfaces::msg::AttitudeCmd());
-    publishAdmittanceActive();
-    publishAdmittanceDesiredForce();
-  }
-
-  double filteredAndLimitedForceError() const
-  {
-    // 부호 규약:
-    //   force_error > 0 : 현재 힘이 목표보다 작음
-    //                     -> +n_contact_world 방향으로 더 전진해야 함
-    //   force_error < 0 : 현재 힘이 목표보다 큼
-    //                     -> -n_contact_world 방향으로 물러나야 함
-    double force_error = f_normal_ref_active_ - f_normal_hat_;
-
-    if (std::abs(force_error) <= std::abs(force_error_deadband_)) {
-      force_error = 0.0;
-    }
-
-    return std::clamp(
-      force_error,
-      -std::abs(force_error_max_),
-      std::abs(force_error_max_));
-  }
-
-  void integrateAdmittance(double dt)
-  {
-    const double adm_mass = std::max(std::abs(adm_mass_), 1e-6);
-    const double force_error = filteredAndLimitedForceError();
-    const double delta_limit = std::abs(x_delta_max_);
-
-    // There is intentionally no contact-present/contact-released condition here.
-    // As long as I has enabled admittance mode, force error is processed every cycle,
-    // even when the estimated normal force is zero.
-    const bool pushing_beyond_positive_limit =
-      x_adm_delta_ >= delta_limit && force_error > 0.0;
-    const bool pushing_beyond_negative_limit =
-      x_adm_delta_ <= -delta_limit && force_error < 0.0;
-
-    // Simple integral anti-windup at the displacement limits.
-    if (!pushing_beyond_positive_limit && !pushing_beyond_negative_limit) {
-      force_error_integral_ += force_error * dt;
-    }
-    force_error_integral_ = std::clamp(
-      force_error_integral_,
-      -std::abs(force_integral_limit_),
-      std::abs(force_integral_limit_));
-
-    const double integral_force = force_integral_gain_ * force_error_integral_;
-
-    // 가상 Mass-Spring-Damper 식을 x_ddot에 대해 정리한 형태:
-    //   x_ddot = (e_F + F_I - D*x_dot - K*x) / M
-    //
-    // e_F가 양수이면 판 방향으로 reference를 가속하고,
-    // D*x_dot은 움직임을 감쇠시키며, K*x는 기준점 복귀 성분을 만든다.
-    double x_adm_ddot =
-      (force_error + integral_force -
-      adm_damping_ * x_adm_dot_ - adm_stiffness_ * x_adm_delta_) /
-      adm_mass;
-
-    x_adm_ddot = std::clamp(
-      x_adm_ddot,
-      -std::abs(x_ddot_max_),
-      std::abs(x_ddot_max_));
-
-    x_adm_dot_ += x_adm_ddot * dt;
-    x_adm_dot_ = std::clamp(
-      x_adm_dot_,
-      -std::abs(x_dot_max_),
-      std::abs(x_dot_max_));
-
-    x_adm_delta_ += x_adm_dot_ * dt;
-
-    // Position saturation with velocity anti-windup.
-    if (x_adm_delta_ >= delta_limit) {
-      x_adm_delta_ = delta_limit;
-      if (x_adm_dot_ > 0.0) {
-        x_adm_dot_ = 0.0;
-      }
-    } else if (x_adm_delta_ <= -delta_limit) {
-      x_adm_delta_ = -delta_limit;
-      if (x_adm_dot_ < 0.0) {
-        x_adm_dot_ = 0.0;
-      }
-    }
-  }
-
-  Eigen::Vector3d computePositionReference(
-    double dt,
-    const Eigen::Vector3d & n_face_world)
-  {
-    if (!admittance_armed_) {
-      mode_ = Mode::NORMAL;
-      return have_cmd_ ? pos_cmd_ : pos_;
-    }
-
-    // This is reached when I was pressed before the first state message arrived.
-    if (mode_ != Mode::ADMITTANCE) {
-      enterAdmittanceMode(n_face_world);
-    }
-
-    // Smoothly change the force target. No contact threshold is involved.
-    f_normal_ref_active_ = moveToward(
-      f_normal_ref_active_,
-      f_normal_des_,
-      std::abs(f_ref_rate_max_) * dt);
-
-    // Always run force-error admittance while I-mode is ON.
-    integrateAdmittance(dt);
-
-    return p_admittance_base_world_ + x_adm_delta_ * n_contact_world_;
-  }
-
-  void updateNormalForce(
-    double dt,
-    const Eigen::Matrix3d & r_wb,
-    const Eigen::Vector3d & force_normal_world)
-  {
-    if (!have_external_wrench_) {
-      f_normal_raw_ = 0.0;
-    } else {
-      const Eigen::Vector3d external_force_world = r_wb * external_force_body_;
-      f_normal_raw_ = std::max(
-        0.0,
-        -force_normal_world.dot(external_force_world));
-    }
-
-    if (!force_filter_initialized_) {
-      f_normal_hat_ = f_normal_raw_;
-      force_filter_initialized_ = true;
-      return;
-    }
-
-    const double cutoff_hz = std::max(0.0, force_lpf_cutoff_hz_);
-    if (cutoff_hz <= 0.0) {
-      f_normal_hat_ = f_normal_raw_;
-      return;
-    }
-
-    // 연속시간 1차 LPF를 샘플주기 dt에 맞게 이산화한 계수이다.
-    // cutoff_hz가 커질수록 alpha가 커져 raw force를 더 빠르게 따라간다.
-    const double alpha = 1.0 - std::exp(-2.0 * kPi * cutoff_hz * dt);
-    f_normal_hat_ +=
-      std::clamp(alpha, 0.0, 1.0) * (f_normal_raw_ - f_normal_hat_);
-  }
-
+  // ROS interfaces
   rclcpp::Subscription<minitrone_interfaces::msg::Cmd>::SharedPtr sub_cmd_;
   rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr sub_att_cmd_;
   rclcpp::Subscription<minitrone_interfaces::msg::MinitroneState>::SharedPtr sub_state_;
   rclcpp::Subscription<minitrone_interfaces::msg::Wrench>::SharedPtr sub_external_wrench_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
+
   rclcpp::Publisher<minitrone_interfaces::msg::Cmd>::SharedPtr pub_cmd_;
   rclcpp::Publisher<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr pub_att_cmd_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_admittance_active_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_admittance_des_force_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_active_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_des_force_;
+
   rclcpp::TimerBase::SharedPtr keyboard_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
 
-  rclcpp::Time last_time_;
-
-  Eigen::Vector3d pos_cmd_{Eigen::Vector3d::Zero()};
-  minitrone_interfaces::msg::AttitudeCmd att_cmd_msg_;
+  // Input commands and state
+  Eigen::Vector3d upstream_pos_cmd_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d upstream_att_cmd_rad_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d pos_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vel_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d rpy_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d w_body_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d external_force_body_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d external_moment_body_{Eigen::Vector3d::Zero()};
 
-  // BODY frame에서 사용자가 지정한 접촉면 방향 단위벡터.
+  // Admittance frame and base pose
+  Eigen::Matrix3d r_wa_{Eigen::Matrix3d::Identity()};
+  Eigen::Matrix3d base_rotation_world_{Eigen::Matrix3d::Identity()};
   Eigen::Vector3d n_face_body_{Eigen::Vector3d::UnitX()};
+  Eigen::Vector3d n_contact_a_{Eigen::Vector3d::UnitX()};
+  Eigen::Vector3d base_pos_world_{Eigen::Vector3d::Zero()};
 
-  // I를 눌러 mode에 들어간 순간의 접촉 방향을 WORLD frame에 고정한 단위벡터.
-  // 작은 자세 변화로 force 투영 방향과 위치 이동 방향이 흔들리는 것을 막는다.
-  Eigen::Vector3d n_contact_world_{Eigen::Vector3d::UnitX()};
-
-  // Admittance mode 진입 시 기준 위치 [m]. 최종 명령은
-  // p_admittance_base_world_ + x_adm_delta_ * n_contact_world_ 로 계산된다.
-  Eigen::Vector3d p_admittance_base_world_{Eigen::Vector3d::Zero()};
-
-  // 직전 제어 주기에 실제 publish한 위치 reference [m].
-  // pos_ref_rate_max에 의한 slew-rate limit과 bumpless mode entry에 사용한다.
+  // HOLD pose and last published reference
+  Eigen::Vector3d hold_pos_world_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d hold_att_rad_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_pos_ref_world_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d last_att_ref_rad_{Eigen::Vector3d::Zero()};
 
-  // 아래 값들은 생성자에서 declare_parameter() 반환값으로 덮어써진다.
-  // 따라서 실제 기본값은 위 ROS2 parameter 선언부의 값을 기준으로 보면 된다.
-  double f_normal_des_{5.0};             // 최종 목표 normal force [N]
-  double f_normal_step_{0.1};            // U/J 1회 입력당 목표 힘 변화량 [N]
-  double f_normal_min_{0.0};             // 목표 힘 하한 [N]
-  double f_normal_max_{20.0};            // 목표 힘 상한 [N]
-  double f_ref_rate_max_{1.0};           // 활성 목표 힘의 최대 변화율 [N/s]
+  // 6-DOF admittance state: [x,y,z,roll,pitch,yaw] in A frame
+  Eigen::Matrix<double, 6, 1> q_{Eigen::Matrix<double, 6, 1>::Zero()};
+  Eigen::Matrix<double, 6, 1> dq_{Eigen::Matrix<double, 6, 1>::Zero()};
+  Eigen::Matrix<double, 6, 1> wrench_filtered_a_{
+    Eigen::Matrix<double, 6, 1>::Zero()};
 
-  double force_lpf_cutoff_hz_{8.0};      // normal force LPF 차단주파수 [Hz]
-  double force_error_deadband_{0.10};    // force error 무시 구간 [N]
-  double force_error_max_{1.50};         // admittance 입력 force error 제한 [N]
-  double force_integral_gain_{0.0};      // force error 적분 gain [1/s]
-  double force_integral_limit_{1.0};     // force error 적분 상태 제한 [N*s]
+  std::array<bool, kDof> axis_enabled_{};
+  std::array<double, kDof> adm_m_{};
+  std::array<double, kDof> adm_d_{};
+  std::array<double, kDof> adm_k_{};
+  std::array<double, kDof> cutoff_hz_{};
+  std::array<double, kDof> input_deadband_{};
+  std::array<double, kDof> input_max_{};
+  std::array<double, kDof> ddq_max_{};
+  std::array<double, kDof> dq_max_{};
+  std::array<double, kDof> q_max_{};
 
-  double adm_mass_{1.0};               // 가상 질량 M
-  double adm_damping_{20.0};             // 가상 감쇠 D [N*s/m]
-  double adm_stiffness_{0.0};            // 가상 강성 K [N/m]
-  double x_ddot_max_{0.05};              // admittance reference 가속도 제한 [m/s^2]
-  double x_dot_max_{0.05};               // admittance reference 속도 제한 [m/s]
-  double x_delta_max_{5.00};               // mode 기준점 대비 최대 변위 [m]
-  double pos_ref_rate_max_{0.05};         // 최종 3D position reference 변화율 [m/s]
+  double f_normal_des_{5.0};
+  double f_normal_step_{0.1};
+  double f_normal_min_{0.0};
+  double f_normal_max_{20.0};
+  double f_ref_rate_max_{1.0};
+  double f_normal_ref_active_{0.0};
+  double normal_force_integral_gain_{0.0};
+  double normal_force_integral_limit_{1.0};
+  double normal_force_integral_{0.0};
+  double wrench_timeout_sec_{0.10};
 
-  double x_adm_delta_{0.0};               // 접촉 방향 위치 보정량 x [m]
-  double x_adm_dot_{0.0};                 // 접촉 방향 위치 reference 속도 [m/s]
+  rclcpp::Time last_control_time_;
+  rclcpp::Time last_wrench_time_;
 
-  double f_normal_raw_{0.0};              // 투영 직후, 필터 전 normal force [N]
-  double f_normal_hat_{0.0};              // LPF가 적용된 제어용 normal force [N]
-  double f_normal_ref_active_{0.0};        // ramp가 적용된 현재 활성 목표 힘 [N]
-  double force_error_integral_{0.0};       // force error 시간 적분값 [N*s]
-
-  Mode mode_{Mode::NORMAL};
-  bool admittance_armed_{false};
+  Mode mode_{Mode::PASSTHROUGH};
+  bool pending_enable_{false};
   bool have_cmd_{false};
   bool have_att_cmd_{false};
   bool have_state_{false};
   bool have_external_wrench_{false};
-  bool force_filter_initialized_{false};
-  bool pos_ref_initialized_{false};
+  bool wrench_filter_initialized_{false};
+  bool output_initialized_{false};
+  bool hold_initialized_{false};
   bool keyboard_enabled_{false};
   bool termios_configured_{false};
   termios old_termios_{};
@@ -811,7 +894,7 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<AdmittanceController>());
+  rclcpp::spin(std::make_shared<AdmittanceController6Dof>());
   rclcpp::shutdown();
   return 0;
 }

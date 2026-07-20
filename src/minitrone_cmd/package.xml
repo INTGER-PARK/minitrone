@@ -12,6 +12,7 @@
 
   <depend>rclcpp</depend>
   <depend>minitrone_interfaces</depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
 
   <export>

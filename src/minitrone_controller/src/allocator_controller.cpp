@@ -35,7 +35,7 @@ public:
 
   AllocatorController() : rclcpp::Node("minitrone_allocator_controller")
   {
-    sub_wrench_ = this->create_subscription<minitrone_interfaces::msg::Wrench>("/minitrone/wrench", 10, std::bind(&AllocatorController::onWrench, this, std::placeholders::_1));
+    sub_wrench_ = this->create_subscription<minitrone_interfaces::msg::Wrench>("/minitrone/wrench_passive_align", 10, std::bind(&AllocatorController::onWrench, this, std::placeholders::_1));
     sub_state_ = this->create_subscription<minitrone_interfaces::msg::MinitroneState>("/minitrone/state", 10, std::bind(&AllocatorController::onState, this, std::placeholders::_1));
 
     pub_input_ = this->create_publisher<minitrone_interfaces::msg::Input>("/minitrone/input", 10);

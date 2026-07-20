@@ -1,19 +1,20 @@
 from launch import LaunchDescription
 from launch.actions import ExecuteProcess, RegisterEventHandler
 from launch.event_handlers import OnProcessStart
+from launch.substitutions import FindExecutable
 from launch_ros.actions import Node
 from datetime import datetime
 from pathlib import Path
 
 def generate_launch_description():
-    workspace_dir = Path("/home/parkjeongsu/ros2_project/minitrone_ws")
+    workspace_dir = Path.home() / "ros2_project" / "minitrone_ws"
     bag_dir = workspace_dir / "bags"
     bag_dir.mkdir(parents=True, exist_ok=True)
     bag_name = str(bag_dir / f"bag_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     bag_record = ExecuteProcess(
         cmd=[
-            "/opt/ros/humble/bin/ros2",
+            FindExecutable(name="ros2"),
             "bag",
             "record",
             "-a",
@@ -33,6 +34,13 @@ def generate_launch_description():
         package="minitrone_controller",
         executable="minitrone_wrench_controller",
         name="minitrone_wrench_controller",
+        output="screen"
+    )
+
+    passive_aligning_controller = Node(
+        package="minitrone_controller",
+        executable="passive_aligning_controller",
+        name="minitrone_passive_aligning_controller",
         output="screen"
     )
 
@@ -56,7 +64,12 @@ def generate_launch_description():
             # Normal: cmd/att_cmd -> wrench controller -> allocator.
             # Optional admittance override uses second-order MoB output and is
             # toggled from minitrone_admittance_controller in a terminal.
-            on_start=[second_mob, wrench_controller, allocator_controller]
+            on_start=[
+                second_mob,
+                wrench_controller,
+                passive_aligning_controller,
+                allocator_controller,
+            ]
         )
     )
 

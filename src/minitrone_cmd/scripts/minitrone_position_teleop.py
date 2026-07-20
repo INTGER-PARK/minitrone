@@ -6,8 +6,9 @@ import tty
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Bool
 
-from minitrone_interfaces.msg import Cmd
+from minitrone_interfaces.msg import Cmd, MinitroneState
 
 
 class PositionTeleop(Node):
@@ -29,6 +30,14 @@ class PositionTeleop(Node):
         self.last_update_time = self.last_key_time
 
         self.pub_cmd = self.create_publisher(Cmd, "/minitrone/cmd", 10)
+        self.sub_state = self.create_subscription(
+            MinitroneState, "/minitrone/state", self._on_state, 10
+        )
+        self.sub_admittance_active = self.create_subscription(
+            Bool, "/minitrone/admittance_active", self._on_admittance_active, 10
+        )
+        self.latest_position = None
+        self.admittance_active = None
         self.timer = self.create_timer(1.0 / max(self.rate_hz, 1.0), self._on_timer)
 
         self._stdin_fd = sys.stdin.fileno()
@@ -61,6 +70,25 @@ class PositionTeleop(Node):
         msg.pos_cmd[1] = float(self.y)
         msg.pos_cmd[2] = float(self.z)
         self.pub_cmd.publish(msg)
+
+    def _on_state(self, msg):
+        self.latest_position = [float(value) for value in msg.pos]
+
+    def _on_admittance_active(self, msg):
+        was_active = self.admittance_active is True
+        self.admittance_active = bool(msg.data)
+        if not was_active or self.admittance_active or self.latest_position is None:
+            return
+
+        self.x, self.y, self.z = self.latest_position
+        self.vx = 0.0
+        self.vy = 0.0
+        self.vz = 0.0
+        self.last_update_time = self.get_clock().now()
+        self.get_logger().info(
+            "admittance OFF: position command synchronized to current pose"
+        )
+        self._print_cmd()
 
     def _read_key(self):
         if not select.select([sys.stdin], [], [], 0.0)[0]:

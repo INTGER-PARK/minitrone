@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(minitrone_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
@@ -21,6 +22,17 @@ target_link_libraries(minitrone_wrench_controller Eigen3::Eigen)
 add_executable(minitrone_admittance_controller src/admittance_controller.cpp)
 ament_target_dependencies(minitrone_admittance_controller rclcpp minitrone_interfaces std_msgs)
 target_link_libraries(minitrone_admittance_controller Eigen3::Eigen)
+
+# passive-aligning hybrid force/motion filter
+add_executable(passive_aligning_controller src/minitrone_passive_aligning_controller.cpp)
+ament_target_dependencies(
+  passive_aligning_controller
+  rclcpp
+  rcl_interfaces
+  minitrone_interfaces
+  std_msgs
+)
+target_link_libraries(passive_aligning_controller Eigen3::Eigen)
 
 # minitrone_allocator_controller
 add_executable(minitrone_allocator_controller src/allocator_controller.cpp)
@@ -45,6 +57,7 @@ target_link_libraries(minitrone_ekf_state_estimator Eigen3::Eigen)
 install(TARGETS
   minitrone_wrench_controller
   minitrone_admittance_controller
+  passive_aligning_controller
   minitrone_allocator_controller
   minitrone_first_wrench_observer
   minitrone_second_wrench_observer

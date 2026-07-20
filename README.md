@@ -33,6 +33,47 @@ For headless use, run the plant without the MuJoCo viewer:
 ros2 run minitrone_plant minitrone_plant --ros-args -p enable_viewer:=false
 ```
 
+For a live PyQtGraph view of `/minitrone/external_wrench_hat_second_order`:
+
+```bash
+sudo apt install python3-pyqt5 python3-pyqtgraph
+ros2 run minitrone_plant minitrone_external_wrench_plot
+```
+
+Optional plot settings:
+
+```bash
+ros2 run minitrone_plant minitrone_external_wrench_plot --ros-args -p window_sec:=15.0 -p refresh_hz:=40.0
+```
+
+The plot layout can be changed in the window from `1 x 1` through `3 x 3`.
+To choose the initial layout from the command line, set `plot_rows` and
+`plot_columns` (each accepts 1 through 3):
+
+```bash
+ros2 run minitrone_plant minitrone_external_wrench_plot --ros-args -p plot_rows:=3 -p plot_columns:=3
+```
+
+The external-wrench view also shows the Center of Pressure (CoP) on a BODY
+`+X` contact surface. Its plate size, minimum valid normal force, trail length,
+and sign convention can be adjusted with ROS parameters:
+
+```bash
+ros2 run minitrone_plant minitrone_external_wrench_plot --ros-args \
+  -p plate_size_y:=0.40 -p plate_size_z:=0.43 \
+  -p cop_force_min:=0.5 -p cop_trail_length:=100 \
+  -p cop_y_sign:=1.0 -p cop_z_sign:=-1.0
+```
+
+For a generic topic picker like `rqt_plot`, use:
+
+```bash
+ros2 run minitrone_plant minitrone_topic_plot
+```
+
+Select a topic on the left, choose one or more numeric fields, and add them to the plot.
+Variable-length arrays appear as `field[]` first and expand to `field[0]`, `field[1]`, ... after the first message is received for that topic.
+
 ## Minitrone-Specific Changes
 
 - `minitrone_plant` maps XML actuators `prop1..prop4` and `servo1..servo4`.

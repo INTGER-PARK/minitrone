@@ -29,7 +29,7 @@
   <compiler angle="radian" coordinate="local" inertiafromgeom="auto" />
   <option gravity="0 0 -9.81" timestep="0.002" />
   <default>
-    <geom friction="0.8 0.1 0.1" density="0" />
+    <geom friction="1.0 1.0 1.0" density="0" />
     <joint damping="0.1" stiffness="0" />
   </default>
 
@@ -57,7 +57,7 @@
     <body name="drone_base" pos="0.000000000 0.000000000 0.185000000">
       <freejoint name="root" />
       <!-- All physical mass concentrated at the body-frame origin. -->
-      <inertial pos="0.000000000 0.000000000 0.126394928" mass="2.5" diaginertia="0.0670417 0.0670417 0.0770417" />
+      <inertial pos="0.000000000 0.000000000 0.000000000" mass="2.5" diaginertia="0.0670417 0.0670417 0.0770417" />
       <site name="drone_imu" pos="0.000000000 0.000000000 0.000000000" quat="1 0 0 0" rgba="1 1 1 1" />
 
       <!-- Decorative visual-only central stack. Collision/dynamics remain governed by the existing geoms/inertial. -->
@@ -79,46 +79,20 @@
 
 
 
-      <!-- Single +X perforated contact surface.
-           Collision and visual envelope are set to 400 mm x 380 mm on the Y-Z plane.
-           It is modeled as four thin box geoms that form one rectangular frame,
-           leaving an actual central opening instead of a solid blue cube.
-           Outer dimensions: y = 0.400 m, z = 0.380 m, x thickness = 0.006 m.
-           The contact face still lies near the +X envelope: outer face x ~= +0.215 m. -->
-      <geom name="contact_plate_px_top" type="box"
-            pos="0.212000000 0.000000000 0.180000000"
-            size="0.003000000 0.200000000 0.010000000"
+      <!-- Single +X contact plate.
+           Collision envelope is a single solid plate on the Y-Z plane.
+           Dimensions: y = 0.400 m, z = 0.380 m, x thickness = 0.006 m. -->
+      <geom name="contact_plate_px" type="box"
+            pos="0.212000000 0.000000000 0.000000000"
+            size="0.003000000 0.200000000 0.190000000"
             material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="contact_plate_px_bottom" type="box"
-            pos="0.212000000 0.000000000 -0.180000000"
-            size="0.003000000 0.200000000 0.010000000"
-            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="contact_plate_px_left" type="box"
-            pos="0.212000000 0.190000000 0.000000000"
-            size="0.003000000 0.010000000 0.170000000"
-            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
-      <geom name="contact_plate_px_right" type="box"
-            pos="0.212000000 -0.190000000 0.000000000"
-            size="0.003000000 0.010000000 0.170000000"
-            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
-
-      <!-- Small visual-only dark rim to make the center hole readable in the viewer. -->
-      <geom name="contact_plate_px_inner_top_rim" type="box"
-            pos="0.215500000 0.000000000 0.170000000"
-            size="0.001000000 0.180000000 0.003000000"
-            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
-      <geom name="contact_plate_px_inner_bottom_rim" type="box"
-            pos="0.215500000 0.000000000 -0.170000000"
-            size="0.001000000 0.180000000 0.003000000"
-            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
-      <geom name="contact_plate_px_inner_left_rim" type="box"
-            pos="0.215500000 0.180000000 0.000000000"
-            size="0.001000000 0.003000000 0.170000000"
-            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
-      <geom name="contact_plate_px_inner_right_rim" type="box"
-            pos="0.215500000 -0.180000000 0.000000000"
-            size="0.001000000 0.003000000 0.170000000"
-            material="mat_contact_edge" contype="0" conaffinity="0" group="1" mass="0" />
+      <!-- Four virtual load-cell locations at the contact-plate corners.
+           The plant distributes MuJoCo's ground-truth contact normal load to
+           these locations and publishes the resulting measured CoP. -->
+      <site name="cop_sensor_pp" type="sphere" pos="0.215 0.200 0.190" size="0.008" rgba="0.1 1 0.1 1" />
+      <site name="cop_sensor_np" type="sphere" pos="0.215 -0.200 0.190" size="0.008" rgba="0.1 1 0.1 1" />
+      <site name="cop_sensor_nn" type="sphere" pos="0.215 -0.200 -0.190" size="0.008" rgba="0.1 1 0.1 1" />
+      <site name="cop_sensor_pn" type="sphere" pos="0.215 0.200 -0.190" size="0.008" rgba="0.1 1 0.1 1" />
       <!-- Top X-frame pipes -->
       <geom name="xpipe_top1" type="capsule" fromto="-0.206249572 -0.206249572 0.000000000 0.206249572 0.206249572 0.000000000" size="0.008139933" material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
       <geom name="xpipe_top2" type="capsule" fromto="-0.206249572 0.206249572 0.000000000 0.206249572 -0.206249572 0.000000000" size="0.008139933" material="mat_tube" contype="1" conaffinity="1" group="0" mass="0" />
@@ -288,6 +262,11 @@
     <position name="servo4_pos" joint="j_servo4" kp="10" kv="0.2" ctrlrange="-1.57079632679 1.57079632679" />
   </actuator>
   <sensor>
+    <!-- Contact-plate corner force sensors: (+y,+z), (-y,+z), (-y,-z), (+y,-z). -->
+    <touch name="cop_force_pp" site="cop_sensor_pp" />
+    <touch name="cop_force_np" site="cop_sensor_np" />
+    <touch name="cop_force_nn" site="cop_sensor_nn" />
+    <touch name="cop_force_pn" site="cop_sensor_pn" />
     <!-- IMU site: drone_imu -->
     <framequat name="body_quat" objtype="site" objname="drone_imu" />
     <gyro name="body_gyro" site="drone_imu" />

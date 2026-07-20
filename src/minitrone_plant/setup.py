@@ -23,6 +23,8 @@ setup(
         'console_scripts': [
             'minitrone_plant = minitrone_plant.plant:main',
             'minitrone_palm_teleop = minitrone_plant.palm_teleop:main',
+            'minitrone_external_wrench_plot = minitrone_plant.minitrone_external_wrench_plot:external_wrench_main',
+            'minitrone_topic_plot = minitrone_plant.minitrone_external_wrench_plot:main',
         ],
     },
 )
