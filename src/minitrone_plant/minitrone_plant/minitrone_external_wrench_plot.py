@@ -30,6 +30,7 @@ except ImportError:
 
 try:
     import pyqtgraph as pg
+    from pyqtgraph.graphicsItems.LegendItem import ItemSample
 except ImportError as exc:
     raise SystemExit("`pyqtgraph` is not installed. Install it before running this node.") from exc
 
@@ -46,6 +47,62 @@ COLORS = (
     "#ffd166",
     "#06d6a0",
 )
+
+
+class ToggleLegendSample(ItemSample):
+    """Legend sample that toggles one curve or a related group of plot items."""
+
+    def __init__(self, item, linked_items=None) -> None:
+        super().__init__(item)
+        self.linked_items = list(linked_items or [item])
+        self.label = None
+
+    def toggle_visibility(self) -> None:
+        visible = any(item.isVisible() for item in self.linked_items)
+        new_visible = not visible
+        for item in self.linked_items:
+            item.setVisible(new_visible)
+        opacity = 1.0 if new_visible else 0.35
+        self.setOpacity(opacity)
+        if self.label is not None:
+            self.label.setOpacity(opacity)
+        self.update()
+
+    def mouseClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.toggle_visibility()
+        event.accept()
+
+
+class ToggleLegendLabel(pg.LabelItem):
+    """Clickable legend text linked to the same visibility toggle as its icon."""
+
+    def __init__(self, text: str, sample: ToggleLegendSample, **kwargs) -> None:
+        super().__init__(text, **kwargs)
+        self.sample = sample
+
+    def mouseClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.sample.toggle_visibility()
+        event.accept()
+
+
+class ClickableLegendItem(pg.LegendItem):
+    """Legend whose icon and text both toggle their associated visualization."""
+
+    def addItem(self, item, name, linked_items=None) -> None:
+        sample = ToggleLegendSample(item, linked_items)
+        label = ToggleLegendLabel(
+            name,
+            sample,
+            color=self.opts["labelTextColor"],
+            justify="left",
+            size=self.opts["labelTextSize"],
+        )
+        sample.label = label
+        self.items.append((sample, label))
+        self._addItemToLayout(sample, label)
+        self.updateSize()
 
 
 @dataclass
@@ -366,11 +423,21 @@ class TopicPlotWindow(QtWidgets.QWidget):
 
         self.setWindowTitle("ROS 2 Topic Plot")
         self.resize(1500, 900)
+        self.setMinimumSize(720, 480)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         pg.setConfigOptions(antialias=False, foreground="#d8dee9", background="#11151c")
 
         root_layout = QtWidgets.QHBoxLayout(self)
-        controls_layout = QtWidgets.QVBoxLayout()
-        root_layout.addLayout(controls_layout, 0)
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(self.main_splitter)
+
+        controls_widget = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
+        self.main_splitter.addWidget(controls_widget)
 
         self.topic_filter_edit = QtWidgets.QLineEdit()
         self.topic_filter_edit.setPlaceholderText("filter topic")
@@ -422,11 +489,24 @@ class TopicPlotWindow(QtWidgets.QWidget):
             controls_layout.addWidget(self.new_window_button)
         controls_layout.addStretch(1)
 
-        plot_layout = QtWidgets.QVBoxLayout()
-        root_layout.addLayout(plot_layout, 1)
+        plot_container = QtWidgets.QWidget()
+        plot_layout = QtWidgets.QVBoxLayout(plot_container)
+        self.main_splitter.addWidget(plot_container)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([320, 1180])
 
         self.status_label = QtWidgets.QLabel(f"ready with {QT_BINDING} + pyqtgraph")
         plot_layout.addWidget(self.status_label)
+
+        self.plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.plot_splitter.setChildrenCollapsible(False)
+        plot_layout.addWidget(self.plot_splitter, 1)
+
+        cop_container = QtWidgets.QWidget()
+        cop_layout = QtWidgets.QVBoxLayout(cop_container)
+        cop_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_splitter.addWidget(cop_container)
 
         self.cop_plot_widget = pg.PlotWidget(
             title="Center of Pressure on Contact Surface"
@@ -435,7 +515,10 @@ class TopicPlotWindow(QtWidgets.QWidget):
         self.cop_plot_widget.setLabel("bottom", "y", units="m")
         self.cop_plot_widget.setLabel("left", "z", units="m")
         self.cop_plot_widget.setAspectLocked(True)
-        self.cop_plot_widget.setMinimumHeight(280)
+        self.cop_plot_widget.setMinimumHeight(120)
+        self.cop_legend = ClickableLegendItem(offset=(10, 10))
+        self.cop_legend.setParentItem(self.cop_plot_widget.plotItem.vb)
+        self.cop_plot_widget.plotItem.legend = self.cop_legend
 
         half_y = 0.5 * self.node.plate_size_y
         half_z = 0.5 * self.node.plate_size_z
@@ -451,6 +534,7 @@ class TopicPlotWindow(QtWidgets.QWidget):
             [0.0], [0.0], symbol="+", size=14, pen=pg.mkPen(width=2)
         )
         self.cop_plot_widget.addItem(self.cop_center_item)
+        self.cop_legend.addItem(self.cop_center_item, "plate center")
         self.cop_trail_item = self.cop_plot_widget.plot([], [], pen=pg.mkPen(width=1))
         self.cop_point_item = pg.ScatterPlotItem(
             [],
@@ -461,6 +545,11 @@ class TopicPlotWindow(QtWidgets.QWidget):
             brush=pg.mkBrush(255, 210, 0, 210),
         )
         self.cop_plot_widget.addItem(self.cop_point_item)
+        self.cop_legend.addItem(
+            self.cop_point_item,
+            "CoP_hat",
+            linked_items=[self.cop_point_item, self.cop_trail_item],
+        )
         self.cop_real_trail_item = self.cop_plot_widget.plot(
             [], [], pen=pg.mkPen(color="#00d9ff", width=1)
         )
@@ -473,6 +562,11 @@ class TopicPlotWindow(QtWidgets.QWidget):
             brush=pg.mkBrush(0, 217, 255, 210),
         )
         self.cop_plot_widget.addItem(self.cop_real_point_item)
+        self.cop_legend.addItem(
+            self.cop_real_point_item,
+            "CoP_real",
+            linked_items=[self.cop_real_point_item, self.cop_real_trail_item],
+        )
 
         y_margin = max(0.02, 0.10 * self.node.plate_size_y)
         z_margin = max(0.02, 0.10 * self.node.plate_size_z)
@@ -486,17 +580,24 @@ class TopicPlotWindow(QtWidgets.QWidget):
             f"CoP_hat waiting: {self.node.cop_hat_topic} | "
             f"CoP_real waiting: {self.node.cop_real_topic}"
         )
-        plot_layout.addWidget(self.cop_plot_widget)
-        plot_layout.addWidget(self.cop_status_label)
+        cop_layout.addWidget(self.cop_plot_widget, 1)
+        cop_layout.addWidget(self.cop_status_label)
 
-        self.plot_grid = QtWidgets.QGridLayout()
-        plot_layout.addLayout(self.plot_grid, 1)
+        time_plot_container = QtWidgets.QWidget()
+        self.plot_grid = QtWidgets.QGridLayout(time_plot_container)
+        self.plot_grid.setContentsMargins(0, 0, 0, 0)
+        self.plot_splitter.addWidget(time_plot_container)
+        self.plot_splitter.setStretchFactor(0, 1)
+        self.plot_splitter.setStretchFactor(1, 2)
+        self.plot_splitter.setSizes([300, 520])
         self.plot_widgets: List[pg.PlotWidget] = []
         for panel_index in range(9):
             plot_widget = pg.PlotWidget(title=f"Plot {panel_index + 1}")
             plot_widget.showGrid(x=True, y=True, alpha=0.25)
             plot_widget.setLabel("bottom", "time", units="s")
-            plot_widget.addLegend()
+            legend = ClickableLegendItem(offset=(10, 10))
+            legend.setParentItem(plot_widget.plotItem.vb)
+            plot_widget.plotItem.legend = legend
             plot_widget.setClipToView(True)
             plot_widget.setDownsampling(mode="peak")
             if self.plot_widgets:
@@ -595,29 +696,40 @@ class TopicPlotWindow(QtWidgets.QWidget):
     def _refresh_topics(self) -> None:
         if self.is_closing or not rclpy.ok():
             return
-        previous_topic = self._selected_topic_name()
         previous_field_selection = self._selected_field_names()
         self.node.discover_topics()
         with self.node.lock:
             self.current_topic_names = list(self.node.topic_infos.keys())
         self._rebuild_topic_list()
-        if previous_topic:
-            self._select_topic_by_name(previous_topic)
-            self._restore_field_selection(previous_field_selection)
+        self._restore_field_selection(previous_field_selection)
         self._auto_add_default_topic_if_needed()
 
     def _rebuild_topic_list(self) -> None:
         selected_topic = self._selected_topic_name()
         pattern = self.topic_filter_edit.text().strip().lower()
+        desired_topics = [
+            topic_name
+            for topic_name in self.current_topic_names
+            if not pattern or pattern in topic_name.lower()
+        ]
+        visible_topics = [
+            self.topic_list.item(index).text()
+            for index in range(self.topic_list.count())
+        ]
+        # Topic discovery runs periodically. Avoid clearing an unchanged list,
+        # because QListWidget.clear() resets the user's scrollbar to the top.
+        if visible_topics == desired_topics:
+            return
+
+        scroll_bar = self.topic_list.verticalScrollBar()
+        previous_scroll_value = scroll_bar.value()
         self.topic_list.blockSignals(True)
         self.topic_list.clear()
-        for topic_name in self.current_topic_names:
-            if pattern and pattern not in topic_name.lower():
-                continue
+        for topic_name in desired_topics:
             self.topic_list.addItem(topic_name)
         self.topic_list.blockSignals(False)
 
-        if selected_topic:
+        if selected_topic and selected_topic in desired_topics:
             self._select_topic_by_name(selected_topic)
         elif self.topic_list.count() > 0:
             self.topic_list.setCurrentRow(0)
@@ -625,6 +737,9 @@ class TopicPlotWindow(QtWidgets.QWidget):
         else:
             self.field_list.clear()
             self.topic_type_label.setText("type: -")
+        scroll_bar.setValue(
+            min(previous_scroll_value, scroll_bar.maximum())
+        )
 
     def _selected_topic_name(self) -> str:
         item = self.topic_list.currentItem()
@@ -825,9 +940,12 @@ class TopicPlotWindow(QtWidgets.QWidget):
                 if dirty:
                     curve.plot_item.setData(times, values)
                 latest_time = max(latest_time, times[-1])
-                visible_values_by_panel[curve.panel_index].append(min(values))
-                visible_values_by_panel[curve.panel_index].append(max(values))
-                latest_summaries.append(f"{curve.field_path}={values[-1]:+.3f}")
+                if curve.plot_item.isVisible():
+                    visible_values_by_panel[curve.panel_index].append(min(values))
+                    visible_values_by_panel[curve.panel_index].append(max(values))
+                    latest_summaries.append(
+                        f"{curve.field_path}={values[-1]:+.3f}"
+                    )
                 curve_sample_counts.append(f"{curve.field_path}:{len(values)}")
                 curves_with_data += 1
 

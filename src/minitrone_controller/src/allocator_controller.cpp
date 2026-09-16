@@ -35,7 +35,15 @@ public:
 
   AllocatorController() : rclcpp::Node("minitrone_allocator_controller")
   {
-    sub_wrench_ = this->create_subscription<minitrone_interfaces::msg::Wrench>("/minitrone/wrench_passive_align", 10, std::bind(&AllocatorController::onWrench, this, std::placeholders::_1));
+    // Enables the verbose "allocator limit: ..." saturation diagnostics.
+    // It is disabled by default and can be changed while the node is running.
+    this->declare_parameter<bool>("enable_saturation_debug", false);
+
+    const auto input_wrench_topic = this->declare_parameter<std::string>(
+      "input_wrench_topic", "/minitrone/wrench_cmd");
+    sub_wrench_ = this->create_subscription<minitrone_interfaces::msg::Wrench>(
+      input_wrench_topic, 10,
+      std::bind(&AllocatorController::onWrench, this, std::placeholders::_1));
     sub_state_ = this->create_subscription<minitrone_interfaces::msg::MinitroneState>("/minitrone/state", 10, std::bind(&AllocatorController::onState, this, std::placeholders::_1));
 
     pub_input_ = this->create_publisher<minitrone_interfaces::msg::Input>("/minitrone/input", 10);
@@ -151,9 +159,11 @@ private:
     out.u[4] = C2_cmd(0); out.u[5] = C2_cmd(1); out.u[6] = C2_cmd(2); out.u[7] = C2_cmd(3);
     pub_input_->publish(out);
 
-    maybeLogAllocatorLimit(
-      B1, B2, C1_raw, S_des, C2_des_, C2_cmd, C1_,
-      conditionNumber(A1_mea), conditionNumber(A2), conditionNumber(A1_cmd));
+    if (this->get_parameter("enable_saturation_debug").as_bool()) {
+      maybeLogAllocatorLimit(
+        B1, B2, C1_raw, S_des, C2_des_, C2_cmd, C1_,
+        conditionNumber(A1_mea), conditionNumber(A2), conditionNumber(A1_cmd));
+    }
   }
 
   Eigen::Vector4d solve4x4(const Eigen::Matrix4d& A, const Eigen::Vector4d& b) const

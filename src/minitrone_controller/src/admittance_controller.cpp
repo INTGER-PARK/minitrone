@@ -6,6 +6,7 @@
 #include <minitrone_interfaces/msg/minitrone_state.hpp>
 #include <minitrone_interfaces/msg/wrench.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/float64.hpp>
 
 #include <Eigen/Dense>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <sys/select.h>
 #include <termios.h>
@@ -144,6 +146,26 @@ public:
       declare_parameter<double>("normal_force_integral_gain", 0.0);
     normal_force_integral_limit_ = std::abs(
       declare_parameter<double>("normal_force_integral_limit", 1.0));
+    handoff_blend_time_ = std::max(
+      0.0, declare_parameter<double>("handoff_blend_time", 2.0));
+    reference_rate_limit_ = std::max(
+      0.0, declare_parameter<double>("reference_rate_limit", 0.20));
+    admittance_state_reset_policy_ = declare_parameter<std::string>(
+      "admittance_state_reset_policy", "preserve_output");
+    if (
+      admittance_state_reset_policy_ != "preserve_output" &&
+      admittance_state_reset_policy_ != "measured_pose")
+    {
+      throw std::invalid_argument(
+              "admittance_state_reset_policy must be preserve_output or measured_pose");
+    }
+    inner_position_kp_ <<
+      std::max(
+      1e-6, declare_parameter<double>("inner_position_kp_x", 28.0)),
+      std::max(
+      1e-6, declare_parameter<double>("inner_position_kp_y", 28.0)),
+      std::max(
+      1e-6, declare_parameter<double>("inner_position_kp_z", 24.0));
 
     if (f_normal_min_ > f_normal_max_) {
       std::swap(f_normal_min_, f_normal_max_);
@@ -155,7 +177,7 @@ public:
     // First 3 axes: [m, m/s] related translational motion.
     // Last 3 axes: [rad, rad/s] related rotational motion.
     // ------------------------------------------------------------------------
-    const std::array<double, kDof> m_default = {1.0, 1.0, 1.0, 0.20, 0.20, 0.30};
+    const std::array<double, kDof> m_default = {1.0, 1.0, 1.0, 1.0, 1.00, 1.00};
     const std::array<double, kDof> d_default = {20.0, 20.0, 20.0, 2.0, 2.0, 2.0};
     const std::array<double, kDof> k_default = {0.0, 0.0, 0.0, 1.0, 1.0, 1.0};
 
@@ -243,6 +265,18 @@ public:
       "/minitrone/admittance_active", 10);
     pub_des_force_ = create_publisher<std_msgs::msg::Float64>(
       "/minitrone/admittance_des_force", 10);
+    pub_position_offset_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/contact_method1/admittance_position_offset", 10);
+    pub_orientation_offset_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/contact_method1/admittance_orientation_offset", 10);
+    pub_state_velocity_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/contact_method1/admittance_state_velocity", 10);
+    pub_reference_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/contact_method1/admittance_reference", 10);
+    pub_blend_ = create_publisher<std_msgs::msg::Float64>(
+      "/minitrone/admittance/blend", 10);
+    pub_force_ref_ramped_ = create_publisher<std_msgs::msg::Float64>(
+      "/minitrone/admittance/force_ref_ramped", 10);
 
     parameter_callback_handle_ = add_on_set_parameters_callback(
       std::bind(
@@ -261,7 +295,7 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "6-DOF admittance ready. I=toggle admittance/HOLD, "
+      "6-DOF admittance ready. O=toggle admittance/HOLD, "
       "P=PASSTHROUGH, U/J=normal force +/- %.2f N",
       f_normal_step_);
   }
@@ -444,12 +478,13 @@ private:
     r_wa_ = r_wb;
     n_contact_a_ = n_face_body_;
 
-    base_pos_world_ = output_initialized_ ? last_pos_ref_world_ : pos_;
-    base_rotation_world_ = output_initialized_ ?
-      rotationWorldFromBody(last_att_ref_rad_) : r_wb;
-
+    const bool preload_contact_force =
+      admittance_state_reset_policy_ == "preserve_output";
+    base_pos_world_ = pos_;
+    base_rotation_world_ = r_wb;
     q_.setZero();
     dq_.setZero();
+    admittance_blend_ = 0.0;
     wrench_filter_initialized_ = false;
     normal_force_integral_ = 0.0;
 
@@ -461,11 +496,45 @@ private:
       f_normal_min_,
       f_normal_des_);
 
+    /*
+     * The inner position controller adds gravity in WORLD before rotating its
+     * force to BODY.  At a pitched contact pose, using the measured position
+     * directly would therefore command a large negative body-normal force.
+     * Seed the normal admittance displacement so the inner position P term
+     * contributes the already measured contact force on top of gravity:
+     *
+     *   k_eff = sum_i Kp_i (n_world_i)^2
+     *   q_n(0) = F_normal_measured / k_eff
+     *
+     * With zero normal virtual stiffness this is an equilibrium whenever the
+     * measured force equals the reference.  It also prevents an old, unused
+     * HOLD output from being mistaken for the active pre-handoff reference.
+     */
+    if (preload_contact_force) {
+      const Eigen::Vector3d n_world = r_wa_ * n_contact_a_;
+      const double k_eff =
+        (inner_position_kp_.array() * n_world.array().square()).sum();
+      const double q_normal = std::clamp(
+        f_normal_ref_active_ / std::max(k_eff, 1e-6),
+        0.0,
+        q_max_[0]);
+      q_.head<3>() = q_normal * n_contact_a_;
+    }
+    entry_pos_ref_world_ = base_pos_world_ + r_wa_ * q_.head<3>();
+    entry_att_ref_rad_ = rpy_;
+    // This node's HOLD output is not selected by the wrench controller during
+    // Mode 3.  Do not let its stale startup reference seed the rate limiter.
+    last_pos_ref_world_ = entry_pos_ref_world_;
+    last_att_ref_rad_ = entry_att_ref_rad_;
+    output_initialized_ = true;
+
     RCLCPP_INFO(
       get_logger(),
-      "ADMITTANCE ON: normal force %.3f N -> desired %.3f N",
+      "ADMITTANCE ON: normal force %.3f N -> desired %.3f N, "
+      "normal preload %.4f m",
       current_normal_force,
-      f_normal_des_);
+      f_normal_des_,
+      n_contact_a_.dot(q_.head<3>()));
   }
 
   void captureCurrentHoldPose()
@@ -646,14 +715,22 @@ private:
     const Eigen::Vector3d delta_position_a = q_.head<3>();
     const Eigen::Vector3d delta_rotation_a = q_.tail<3>();
 
-    pos_ref_world = base_pos_world_ + r_wa_ * delta_position_a;
+    const Eigen::Vector3d admittance_pos_ref =
+      base_pos_world_ + r_wa_ * delta_position_a;
 
     // The virtual angular displacement is expressed in A. Convert it to WORLD
     // and left-compose it with the base command orientation.
     const Eigen::Vector3d delta_rotation_world = r_wa_ * delta_rotation_a;
     const Eigen::Matrix3d r_ref =
       rotationExp(delta_rotation_world) * base_rotation_world_;
-    att_ref_rad = rpyFromRotation(r_ref);
+    const Eigen::Vector3d admittance_att_ref = rpyFromRotation(r_ref);
+
+    pos_ref_world =
+      (1.0 - admittance_blend_) * entry_pos_ref_world_ +
+      admittance_blend_ * admittance_pos_ref;
+    att_ref_rad =
+      (1.0 - admittance_blend_) * entry_att_ref_rad_ +
+      admittance_blend_ * admittance_att_ref;
 
     if (output_initialized_) {
       att_ref_rad.x() = unwrapNear(att_ref_rad.x(), last_att_ref_rad_.x());
@@ -672,6 +749,9 @@ private:
     }
 
     if (mode_ == Mode::ADMITTANCE) {
+      admittance_blend_ = handoff_blend_time_ <= 1e-6 ? 1.0 :
+        moveToward(
+        admittance_blend_, 1.0, dt / handoff_blend_time_);
       f_normal_ref_active_ = moveToward(
         f_normal_ref_active_,
         f_normal_des_,
@@ -682,6 +762,12 @@ private:
         updateFilteredWrench(dt, r_wb);
         const Eigen::Matrix<double, 6, 1> input = computeAdmittanceInput(dt);
         integrateAdmittance(input, dt);
+        if (!q_.array().isFinite().all() || !dq_.array().isFinite().all()) {
+          q_.setZero();
+          dq_.setZero();
+          normal_force_integral_ = 0.0;
+          RCLCPP_ERROR(get_logger(), "non-finite admittance state rejected and reset");
+        }
       } else {
         // Never interpret a stale/missing estimator value as zero contact force.
         // Freeze the virtual velocity instead of driving toward the wall.
@@ -695,6 +781,14 @@ private:
     Eigen::Vector3d pos_ref_world;
     Eigen::Vector3d att_ref_rad;
     computeOutputReference(pos_ref_world, att_ref_rad);
+    if (output_initialized_ && reference_rate_limit_ > 0.0) {
+      Eigen::Vector3d delta = pos_ref_world - last_pos_ref_world_;
+      const double max_delta = reference_rate_limit_ * dt;
+      if (delta.norm() > max_delta && delta.norm() > 1e-12) {
+        pos_ref_world =
+          last_pos_ref_world_ + delta * (max_delta / delta.norm());
+      }
+    }
 
     minitrone_interfaces::msg::Cmd cmd_msg;
     cmd_msg.pos_cmd[0] = static_cast<float>(pos_ref_world.x());
@@ -708,6 +802,22 @@ private:
 
     pub_cmd_->publish(cmd_msg);
     pub_att_cmd_->publish(att_msg);
+
+    std_msgs::msg::Float64MultiArray pos_offset_msg;
+    pos_offset_msg.data = {q_[0], q_[1], q_[2]};
+    pub_position_offset_->publish(pos_offset_msg);
+    std_msgs::msg::Float64MultiArray att_offset_msg;
+    att_offset_msg.data = {q_[3], q_[4], q_[5]};
+    pub_orientation_offset_->publish(att_offset_msg);
+    std_msgs::msg::Float64MultiArray velocity_msg;
+    velocity_msg.data = {
+      dq_[0], dq_[1], dq_[2], dq_[3], dq_[4], dq_[5]};
+    pub_state_velocity_->publish(velocity_msg);
+    std_msgs::msg::Float64MultiArray reference_msg;
+    reference_msg.data = {
+      pos_ref_world.x(), pos_ref_world.y(), pos_ref_world.z(),
+      att_ref_rad.x(), att_ref_rad.y(), att_ref_rad.z()};
+    pub_reference_->publish(reference_msg);
 
     last_pos_ref_world_ = pos_ref_world;
     last_att_ref_rad_ = att_ref_rad;
@@ -724,6 +834,10 @@ private:
     std_msgs::msg::Float64 force_msg;
     force_msg.data = f_normal_des_;
     pub_des_force_->publish(force_msg);
+    force_msg.data = f_normal_ref_active_;
+    pub_force_ref_ramped_->publish(force_msg);
+    force_msg.data = admittance_blend_;
+    pub_blend_->publish(force_msg);
   }
 
   void adjustDesiredForce(double delta)
@@ -796,7 +910,7 @@ private:
       return;
     }
 
-    if (key == 'I' || key == 'i') {
+    if (key == 'O' || key == 'o') {
       requestEnabled(mode_ != Mode::ADMITTANCE);
     } else if (key == 'P' || key == 'p') {
       requestEnabled(false);
@@ -819,6 +933,12 @@ private:
   rclcpp::Publisher<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr pub_att_cmd_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_active_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_des_force_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr
+    pub_blend_, pub_force_ref_ramped_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_position_offset_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_orientation_offset_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
+    pub_state_velocity_, pub_reference_;
 
   rclcpp::TimerBase::SharedPtr keyboard_timer_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
@@ -845,6 +965,8 @@ private:
   Eigen::Vector3d hold_att_rad_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_pos_ref_world_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_att_ref_rad_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d entry_pos_ref_world_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d entry_att_ref_rad_{Eigen::Vector3d::Zero()};
 
   // 6-DOF admittance state: [x,y,z,roll,pitch,yaw] in A frame
   Eigen::Matrix<double, 6, 1> q_{Eigen::Matrix<double, 6, 1>::Zero()};
@@ -873,6 +995,11 @@ private:
   double normal_force_integral_limit_{1.0};
   double normal_force_integral_{0.0};
   double wrench_timeout_sec_{0.10};
+  double handoff_blend_time_{2.0};
+  double reference_rate_limit_{0.20};
+  double admittance_blend_{0.0};
+  std::string admittance_state_reset_policy_{"preserve_output"};
+  Eigen::Vector3d inner_position_kp_{28.0, 28.0, 24.0};
 
   rclcpp::Time last_control_time_;
   rclcpp::Time last_wrench_time_;

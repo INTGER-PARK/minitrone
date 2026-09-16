@@ -33,6 +33,16 @@ For headless use, run the plant without the MuJoCo viewer:
 ros2 run minitrone_plant minitrone_plant --ros-args -p enable_viewer:=false
 ```
 
+When the MuJoCo viewer opens, propeller visual groups and the contact-plate
+resultant-force arrow are enabled by default. Press `F` in the viewer to toggle
+the red wall-on-plate force arrow. Initial visibility can also be configured:
+
+```bash
+ros2 run minitrone_plant minitrone_plant --ros-args \
+  -p viewer_show_propellers:=true \
+  -p viewer_show_contact_forces:=true
+```
+
 For a live PyQtGraph view of `/minitrone/external_wrench_hat_second_order`:
 
 ```bash

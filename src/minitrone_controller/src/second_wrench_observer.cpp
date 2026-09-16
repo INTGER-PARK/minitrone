@@ -55,9 +55,12 @@ public:
     gravity_ = this->declare_parameter<double>("gravity", 9.81);
     // Diagonal body inertia matrix entries.
     // Unit: kg*m^2.
-    inertia_xx_ = this->declare_parameter<double>("inertia_xx", 0.360702);
-    inertia_yy_ = this->declare_parameter<double>("inertia_yy", 0.360702);
-    inertia_zz_ = this->declare_parameter<double>("inertia_zz", 0.660702);
+    // Must match drone_base/inertial in the MuJoCo model.  A mismatched
+    // inertia scales d(J*omega)/dt and can make the estimated contact moment
+    // have the wrong sign during angular acceleration.
+    inertia_xx_ = this->declare_parameter<double>("inertia_xx", 0.0670417);
+    inertia_yy_ = this->declare_parameter<double>("inertia_yy", 0.0670417);
+    inertia_zz_ = this->declare_parameter<double>("inertia_zz", 0.0770417);
     // Fixed simulation/state period used by the discrete observer update.
     // Unit: s. Default 1/400 s = 0.0025 s.
     state_dt_ = this->declare_parameter<double>("state_dt", 1.0 / 400.0);
@@ -66,6 +69,18 @@ public:
       1e-6, 0.5 * std::abs(this->declare_parameter<double>("plate_size_y", 0.40)));
     cop_half_z_ = std::max(
       1e-6, 0.5 * std::abs(this->declare_parameter<double>("plate_size_z", 0.38)));
+    // Contact-plate frame C relative to the body/CoM frame B.
+    // r_BC points from the vehicle CoM to the center of the +x_C contact face.
+    r_com_to_contact_body_ <<
+      this->declare_parameter<double>("r_com_to_contact_x", 0.215),
+      this->declare_parameter<double>("r_com_to_contact_y", 0.0),
+      this->declare_parameter<double>("r_com_to_contact_z", 0.0);
+    const Eigen::Vector3d contact_frame_rpy_body(
+      this->declare_parameter<double>("contact_frame_roll_rad", 0.0),
+      this->declare_parameter<double>("contact_frame_pitch_rad", 0.0),
+      this->declare_parameter<double>("contact_frame_yaw_rad", 0.0));
+    rotation_body_from_contact_ =
+      rotationWorldFromBody(contact_frame_rpy_body);
 
     inertia_body_.setZero();
     inertia_body_(0, 0) = inertia_xx_;
@@ -221,12 +236,30 @@ private:
     msg.moment[2] = static_cast<float>(moment_body.z());
     pub_external_wrench_hat_->publish(msg);
 
+    /*
+     * Convert the observer wrench from the CoM/body frame B to the contact
+     * plate center/frame C before computing CoP:
+     *
+     *   tau_C^B = tau_CoM^B - r_BC^B x f^B
+     *   f^C     = R_BC^T f^B
+     *   tau^C   = R_BC^T tau_C^B
+     *
+     * For a wall force f_x^C=-Fn applied at [0, y_C, z_C],
+     * tau_y^C=-z_C Fn and tau_z^C=y_C Fn.
+     */
+    const Eigen::Vector3d moment_contact_center_body =
+      moment_body - r_com_to_contact_body_.cross(force_body); //: τ_C = τ_CoM - r_BC × F
+    const Eigen::Vector3d force_contact =
+      rotation_body_from_contact_.transpose() * force_body;
+    const Eigen::Vector3d moment_contact =
+      rotation_body_from_contact_.transpose() * moment_contact_center_body;
+
     minitrone_interfaces::msg::CenterOfPressure cop;
-    cop.normal_force = -force_body.x();
+    cop.normal_force = -force_contact.x();
     cop.valid = std::isfinite(cop.normal_force) && cop.normal_force >= cop_force_min_;
     if (cop.valid) {
-      cop.y = moment_body.z() / cop.normal_force;
-      cop.z = -moment_body.y() / cop.normal_force;
+      cop.y = moment_contact.z() / cop.normal_force;
+      cop.z = -moment_contact.y() / cop.normal_force;
       const double yu = std::clamp(cop.y / cop_half_y_, -1.0, 1.0);
       const double zu = std::clamp(cop.z / cop_half_z_, -1.0, 1.0);
       cop.corner_forces[0] = cop.normal_force * 0.25 * (1.0 + yu) * (1.0 + zu);
@@ -312,14 +345,16 @@ private:
   std::string output_topic_{"/minitrone/external_wrench_hat_second_order"};
   double mass_{4.0};
   double gravity_{9.81};
-  double inertia_xx_{0.360702};
-  double inertia_yy_{0.360702};
-  double inertia_zz_{0.660702};
+  double inertia_xx_{0.0670417};
+  double inertia_yy_{0.0670417};
+  double inertia_zz_{0.0770417};
   double state_dt_{1.0 / 400.0};
   double cop_force_min_{0.5};
   double cop_half_y_{0.20};
   double cop_half_z_{0.19};
   double prev_sim_time_{0.0};
+  Eigen::Vector3d r_com_to_contact_body_{0.215, 0.0, 0.0};
+  Eigen::Matrix3d rotation_body_from_contact_{Eigen::Matrix3d::Identity()};
 
   Eigen::Vector3d omega_n_force_{kDefaultOmegaN, kDefaultOmegaN, kDefaultOmegaN};
   Eigen::Vector3d omega_n_moment_{kDefaultOmegaN, kDefaultOmegaN, kDefaultOmegaN};

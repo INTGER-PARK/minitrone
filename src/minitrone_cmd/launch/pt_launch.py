@@ -52,7 +52,6 @@ def generate_launch_description():
             target_action=plant,
             on_start=[
                 wrench_controller,
-                passive_aligning_controller,
                 allocator_controller,
                 ekf_state_estimator,
             ]

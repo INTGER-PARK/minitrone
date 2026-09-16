@@ -37,13 +37,6 @@ def generate_launch_description():
         output="screen"
     )
 
-    passive_aligning_controller = Node(
-        package="minitrone_controller",
-        executable="passive_aligning_controller",
-        name="minitrone_passive_aligning_controller",
-        output="screen"
-    )
-
     allocator_controller = Node(
         package="minitrone_controller",
         executable="minitrone_allocator_controller",
@@ -67,7 +60,6 @@ def generate_launch_description():
             on_start=[
                 second_mob,
                 wrench_controller,
-                passive_aligning_controller,
                 allocator_controller,
             ]
         )

@@ -285,7 +285,7 @@ private:
   std::function<double(double,double,double,double,bool)> pid_pos_[3];
   std::function<double(double,double,double,double,bool)> pid_att_[3];
 
-  double mass_{1.0};
+  double mass_{2.5};
   double grav_{9.81};
   bool have_state_{false}, have_cmd_{false}, have_att_cmd_{false};
   bool have_admittance_cmd_{false}, have_admittance_att_cmd_{false};

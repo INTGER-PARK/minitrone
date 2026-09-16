@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os, time, math, threading
+from collections import deque
 from typing import Optional
 
 import numpy as np
 import rclpy
+from rclpy._rclpy_pybind11 import RCLError
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
 
@@ -11,7 +13,7 @@ import mujoco
 import mujoco.viewer
 
 from minitrone_interfaces.msg import CenterOfPressure, Input, MinitroneState, MobObserverInput, Wrench
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Bool, Float64, Float64MultiArray, Int32
 
 PHYSICS_HZ = 400.0
 ZETA = 0.02          # thrust = ZETA * omega^2  (minitrone allocator/plant convention)
@@ -24,9 +26,6 @@ SIG_VEL   = 1e-3
 SIG_GYRO  = 1e-3
 SIG_SERVO = 1e-4
 
-COM_PRINT_PERIOD_S = 1.0
-
-
 def quat_to_rpy(q_wxyz: np.ndarray) -> np.ndarray:
     w, x, y, z = [float(v) for v in q_wxyz]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -34,19 +33,6 @@ def quat_to_rpy(q_wxyz: np.ndarray) -> np.ndarray:
     pitch = math.asin(s)
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
     return np.array([roll, pitch, yaw], dtype=float)
-
-def rpy_to_R_WB(rpy: np.ndarray) -> np.ndarray:
-    r, p, y = float(rpy[0]), float(rpy[1]), float(rpy[2])
-    sr, cr = math.sin(r), math.cos(r)
-    sp, cp = math.sin(p), math.cos(p)
-    sy, cy = math.sin(y), math.cos(y)
-
-    return np.array([
-        [ cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
-        [ sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
-        [   -sp,             cp*sr,             cp*cr]
-    ], dtype=float)
-
 
 def rpy_to_quat_wxyz(rpy: np.ndarray) -> np.ndarray:
     r, p, y = float(rpy[0]), float(rpy[1]), float(rpy[2])
@@ -61,10 +47,34 @@ def rpy_to_quat_wxyz(rpy: np.ndarray) -> np.ndarray:
     ], dtype=float)
 
 
+def rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
+    """Return XYZ roll/pitch/yaw for a WORLD-from-BODY rotation matrix."""
+    pitch = math.asin(float(np.clip(-rotation[2, 0], -1.0, 1.0)))
+    roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+    yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    return np.array([roll, pitch, yaw], dtype=float)
+
+
 class PlantRosNode(Node):
     def __init__(self):
         super().__init__("minitrone_plant")  # 이름 유지
         self.enable_viewer = bool(self.declare_parameter("enable_viewer", True).value)
+        self.viewer_show_propellers = bool(
+            self.declare_parameter(
+                "viewer_show_propellers", True).value)
+        self.viewer_contact_force_enabled = bool(
+            self.declare_parameter(
+                "viewer_show_contact_forces", True).value)
+        self.viewer_contact_force_scale = max(
+            0.0,
+            float(self.declare_parameter(
+                "viewer_contact_force_scale", 0.03).value),
+        )
+        self.viewer_contact_force_width = max(
+            1e-4,
+            float(self.declare_parameter(
+                "viewer_contact_force_width", 0.008).value),
+        )
 
         # -------- Load MuJoCo model --------
         pkg_share = get_package_share_directory("minitrone_plant")
@@ -73,9 +83,8 @@ class PlantRosNode(Node):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = 1.0 / PHYSICS_HZ
-
-        # --- printing ---
-        self._last_com_print_t = 0.0
+        random_seed = int(self.declare_parameter("random_seed", 1).value)
+        self.rng = np.random.default_rng(random_seed)
 
         def aid(name: str) -> int:
             idx = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name.encode())
@@ -130,9 +139,56 @@ class PlantRosNode(Node):
         )
         if self.contact_plate_geom_id < 0:
             raise RuntimeError("Contact geom 'contact_plate_px' not found in XML")
-        self.cop_half_y = 0.200
-        self.cop_half_z = 0.190
+        plate_size = np.asarray(
+            self.model.geom_size[self.contact_plate_geom_id], dtype=float)
+        plate_center = np.asarray(
+            self.model.geom_pos[self.contact_plate_geom_id], dtype=float)
+        plate_rotation_body_flat = np.empty(9, dtype=float)
+        mujoco.mju_quat2Mat(
+            plate_rotation_body_flat,
+            self.model.geom_quat[self.contact_plate_geom_id],
+        )
+        self.rotation_body_contact = plate_rotation_body_flat.reshape(3, 3)
+        # C is the center of the outward +X contact face, not the box geom
+        # center. Read both pose and orientation from the loaded model.
+        self.contact_center_body = (
+            plate_center
+            + self.rotation_body_contact
+            @ np.array([plate_size[0], 0.0, 0.0], dtype=float)
+        )
+        self.cop_half_y = float(plate_size[1])
+        self.cop_half_z = float(plate_size[2])
         self.cop_force_min = 0.5
+        self.wall_body_id = bid("hand_palm")
+        self.wall_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "hand_palm_col"
+        )
+        if self.wall_geom_id < 0:
+            raise RuntimeError("Wall contact geom 'hand_palm_col' not found")
+        # condim=3 is the normal Method-1 model. The flat plate already
+        # produces pitch/yaw moments through its distributed contact forces;
+        # condim=6 adds local rolling torques that can cancel those moments and
+        # makes a wrench-derived CoP appear near the plate center. Case D
+        # remains available as an explicit A/B diagnostic.
+        self.contact_test_case = str(
+            self.declare_parameter("contact_test_case", "B").value
+        ).strip().upper()
+        self.isolate_plate_wall_contact = bool(
+            self.declare_parameter(
+                "isolate_plate_wall_contact", True).value)
+        self.contact_solref_timeconst = float(
+            self.declare_parameter(
+                "contact_solref_timeconst_sec", 0.0).value)
+        self.contact_solref_dampratio = max(
+            0.0, float(self.declare_parameter(
+                "contact_solref_dampratio", 1.0).value))
+        self.contact_margin = float(
+            self.declare_parameter("contact_margin", -1.0).value)
+        solver_iterations = int(
+            self.declare_parameter("solver_iterations", 0).value)
+        if solver_iterations > 0:
+            self.model.opt.iterations = solver_iterations
+        self._configure_contact_test_case()
         self.prop_site_id = [
             siteid("prop1_site"),
             siteid("prop2_site"),
@@ -196,6 +252,55 @@ class PlantRosNode(Node):
         self.pub_cop_real = self.create_publisher(
             CenterOfPressure, "/minitrone/cop_real", 10
         )
+        self.pub_contact_wrench_gt = self.create_publisher(
+            Wrench, "/contact_method1/contact_wrench_ground_truth_com", 10
+        )
+        self.pub_contact_wrench_center_gt = self.create_publisher(
+            Wrench, "/contact_method1/contact_wrench_ground_truth_C", 10
+        )
+        self.pub_contact_count = self.create_publisher(
+            Int32, "/contact_method1/contact_count", 10
+        )
+        self.pub_contact_points_body = self.create_publisher(
+            Float64MultiArray, "/contact_method1/contact_points_body", 10
+        )
+        self.pub_plate_corner_gaps = self.create_publisher(
+            Float64MultiArray, "/contact_method1/plate_corner_wall_gap", 10
+        )
+        self.pub_my_normal = self.create_publisher(
+            Float64, "/contact_method1/debug/my_normal", 10
+        )
+        self.pub_my_tangential = self.create_publisher(
+            Float64, "/contact_method1/debug/my_tangential", 10
+        )
+        self.pub_my_local = self.create_publisher(
+            Float64, "/contact_method1/debug/my_local_condim", 10
+        )
+        self.pub_my_contact_total = self.create_publisher(
+            Float64, "/contact_method1/debug/my_contact_total", 10
+        )
+        self.pub_contact_fn = self.create_publisher(
+            Float64, "/contact_method1/debug/fn_ground_truth", 10
+        )
+        self.pub_contact_fz = self.create_publisher(
+            Float64, "/contact_method1/debug/fz_ground_truth", 10
+        )
+        self.pub_contact_region = self.create_publisher(
+            Int32, "/contact_method1/debug/contact_region", 10
+        )
+        self.pub_zero_contact = self.create_publisher(
+            Bool, "/contact_method1/debug/zero_contact", 10
+        )
+        self.pub_contact_region_change_rate = self.create_publisher(
+            Float64, "/contact_method1/debug/contact_region_change_rate", 10
+        )
+        self.pub_other_wall_contact_count = self.create_publisher(
+            Int32, "/contact_method1/debug/other_wall_contact_count", 10
+        )
+        self.pub_relative_orientation_error = self.create_publisher(
+            Float64MultiArray,
+            "/contact_method1/debug/relative_orientation_error", 10
+        )
         self.sub_palm_pose = self.create_subscription(
             Float64MultiArray, "/minitrone/palm_pose_cmd", self.on_palm_pose_cmd, 10
         )
@@ -203,6 +308,8 @@ class PlantRosNode(Node):
 
         self._lock = threading.Lock()
         self._stop = False
+        self._last_contact_region = 0
+        self._contact_region_change_times = deque()
 
         self.sim_thread = threading.Thread(target=self.sim_loop, daemon=True)
         if self.enable_viewer:
@@ -211,6 +318,82 @@ class PlantRosNode(Node):
         self.sim_thread.start()
 
         self.get_logger().info("[minitrone_plant] started (prop1~4, servo1~4)")
+
+    def _configure_contact_test_case(self):
+        """Select a repeatable wall-contact A/B model without editing XML."""
+        case = self.contact_test_case
+        if case not in {"A", "B", "C", "D"}:
+            raise ValueError(
+                "contact_test_case must be A, B, C, or D; "
+                f"received {self.contact_test_case!r}"
+            )
+
+        if case == "D":
+            self.get_logger().info(
+                "contact test D: XML condim/friction unchanged"
+            )
+        else:
+            condim = {"A": 1, "B": 3, "C": 6}[case]
+            # Give the wall higher priority so its condim/friction wins when
+            # MuJoCo combines it with the plate.
+            self.model.geom_priority[self.wall_geom_id] = 1
+            self.model.geom_condim[self.wall_geom_id] = condim
+            self.model.geom_condim[self.contact_plate_geom_id] = condim
+
+            if case == "A":
+                friction = np.array([0.0, 0.0, 0.0], dtype=float)
+            elif case == "B":
+                friction = np.array([1.2, 0.0, 0.0], dtype=float)
+            else:
+                # condim=6 is retained while rolling/torsional friction is made
+                # negligible. Sliding friction remains identical to Case B.
+                friction = np.array([1.2, 1.0e-6, 1.0e-6], dtype=float)
+
+            self.model.geom_friction[self.wall_geom_id, :] = friction
+            self.model.geom_friction[self.contact_plate_geom_id, :] = friction
+            self.get_logger().info(
+                f"contact test {case}: condim={condim}, "
+                f"friction={friction.tolist()}"
+            )
+
+            if self.isolate_plate_wall_contact:
+                # Collision bit 2 is reserved for the Method-1 plate/wall pair.
+                # Other drone geoms retain bit 1, so decorative/frame contacts
+                # cannot duplicate the intended plate contact.
+                for geom_id in (
+                    self.wall_geom_id, self.contact_plate_geom_id):
+                    self.model.geom_contype[geom_id] = 2
+                    self.model.geom_conaffinity[geom_id] = 2
+
+        if self.contact_solref_timeconst > 0.0:
+            minimum_timeconst = 2.0 * float(self.model.opt.timestep)
+            if self.contact_solref_timeconst < minimum_timeconst:
+                raise ValueError(
+                    "contact_solref_timeconst_sec must be at least "
+                    f"2*timestep={minimum_timeconst:.6f} s")
+            # Positive solref format is (timeconst, dampratio). This is not the
+            # negative direct (stiffness, damping) format used by the XML.
+            for geom_id in (
+                self.wall_geom_id, self.contact_plate_geom_id):
+                self.model.geom_solref[geom_id, :] = np.array(
+                    [self.contact_solref_timeconst,
+                     self.contact_solref_dampratio], dtype=float)
+
+        if self.contact_margin >= 0.0:
+            for geom_id in (
+                self.wall_geom_id, self.contact_plate_geom_id):
+                self.model.geom_margin[geom_id] = self.contact_margin
+
+        wall_solref = self.model.geom_solref[self.wall_geom_id].tolist()
+        self.get_logger().info(
+            "contact physics: "
+            f"timestep={self.model.opt.timestep:.6f}s "
+            f"iterations={self.model.opt.iterations} "
+            f"wall_solref={wall_solref} "
+            f"wall_solimp={self.model.geom_solimp[self.wall_geom_id].tolist()} "
+            f"margin={self.model.geom_margin[self.wall_geom_id]:.6f} "
+            f"isolated_pair={self.isolate_plate_wall_contact}"
+        )
 
     def on_input(self, msg: Input):
         u = np.asarray(msg.u, dtype=float)
@@ -244,7 +427,7 @@ class PlantRosNode(Node):
         return np.array(self.data.sensordata[adr:adr+dim], dtype=float)
 
     def _noisy(self, x: np.ndarray, sigma: float) -> np.ndarray:
-        return x + np.random.normal(0.0, sigma, size=x.shape)
+        return x + self.rng.normal(0.0, sigma, size=x.shape)
 
     def _publish_palm_pose(self):
         if self.palm_body_id < 0:
@@ -320,9 +503,10 @@ class PlantRosNode(Node):
     def _measured_corner_loads(self) -> np.ndarray:
         """Distribute MuJoCo contact normal loads to four plate-corner load cells."""
         loads = np.zeros(4, dtype=float)
-        base_pos = np.asarray(self.data.xpos[self.base_body_id], dtype=float)
-        r_bw = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3).T
         contact_wrench = np.zeros(6, dtype=float)
+        rotation_world_contact, contact_center_world = (
+            self._contact_plate_frame_world()
+        )
 
         for contact_index in range(self.data.ncon):
             contact = self.data.contact[contact_index]
@@ -336,9 +520,14 @@ class PlantRosNode(Node):
             if normal_load <= 0.0:
                 continue
 
-            contact_body = r_bw @ (np.asarray(contact.pos, dtype=float) - base_pos)
-            y_unit = float(np.clip(contact_body[1] / self.cop_half_y, -1.0, 1.0))
-            z_unit = float(np.clip(contact_body[2] / self.cop_half_z, -1.0, 1.0))
+            contact_plate = (
+                rotation_world_contact.T
+                @ (np.asarray(contact.pos, dtype=float) - contact_center_world)
+            )
+            y_unit = float(np.clip(
+                contact_plate[1] / self.cop_half_y, -1.0, 1.0))
+            z_unit = float(np.clip(
+                contact_plate[2] / self.cop_half_z, -1.0, 1.0))
             loads += normal_load * 0.25 * np.array([
                 (1.0 + y_unit) * (1.0 + z_unit),
                 (1.0 - y_unit) * (1.0 + z_unit),
@@ -347,22 +536,264 @@ class PlantRosNode(Node):
             ])
         return loads
 
+    def _contact_plate_frame_world(self):
+        """Return WORLD-from-CONTACT rotation and the contact-face center."""
+        rotation_world_contact = np.asarray(
+            self.data.geom_xmat[self.contact_plate_geom_id],
+            dtype=float,
+        ).reshape(3, 3)
+        plate_geom_center_world = np.asarray(
+            self.data.geom_xpos[self.contact_plate_geom_id],
+            dtype=float,
+        )
+        contact_center_world = (
+            plate_geom_center_world
+            + rotation_world_contact
+            @ np.array([
+                self.model.geom_size[self.contact_plate_geom_id, 0],
+                0.0,
+                0.0,
+            ])
+        )
+        return rotation_world_contact, contact_center_world
+
+    def _cop_from_corner_loads(self, loads: np.ndarray):
+        """Return (normal force, y_C, z_C), or None below the CoP threshold."""
+        normal_force = float(np.sum(loads))
+        if normal_force < self.cop_force_min:
+            return None
+        corner_y = (
+            np.array([1.0, -1.0, -1.0, 1.0], dtype=float)
+            * self.cop_half_y
+        )
+        corner_z = (
+            np.array([1.0, 1.0, -1.0, -1.0], dtype=float)
+            * self.cop_half_z
+        )
+        cop_y = float(np.dot(loads, corner_y) / normal_force)
+        cop_z = float(np.dot(loads, corner_z) / normal_force)
+        return normal_force, cop_y, cop_z
+
     def _publish_cop_real(self):
         loads = self._measured_corner_loads()
-        normal_force = float(np.sum(loads))
+        cop = self._cop_from_corner_loads(loads)
         msg = CenterOfPressure()
-        msg.normal_force = normal_force
+        msg.normal_force = float(np.sum(loads))
         msg.corner_forces = loads.tolist()
-        msg.valid = normal_force >= self.cop_force_min
+        msg.valid = cop is not None
         if msg.valid:
-            corner_y = np.array([1.0, -1.0, -1.0, 1.0]) * self.cop_half_y
-            corner_z = np.array([1.0, 1.0, -1.0, -1.0]) * self.cop_half_z
-            msg.y = float(np.dot(loads, corner_y) / normal_force)
-            msg.z = float(np.dot(loads, corner_z) / normal_force)
+            _, msg.y, msg.z = cop
         self.pub_cop_real.publish(msg)
+
+    def _plate_wall_contact_debug(self):
+        """Publish validation-only MuJoCo contact geometry and wrench signals.
+
+        The wrench is the wall-on-drone contact wrench, expressed in BODY and
+        shifted to the drone CoM. It is never used as a controller input.
+
+        ``mj_contactForce`` fills a spatial vector in CONTACT coordinates:
+        [normal force, tangent-1 force, tangent-2 force,
+         torsional torque, rolling-1 torque, rolling-2 torque].
+        ``contact.frame`` stores contact axes in WORLD; its transpose below
+        maps the contact-frame force/torque into WORLD.  The spatial wrench is
+        treated as acting on geom2, and its sign is reversed when the drone
+        plate is geom1.  These ground-truth values are diagnostic only.
+        """
+        base_pos_world = np.asarray(
+            self.data.xpos[self.base_body_id], dtype=float)
+        rotation_world_body = np.asarray(
+            self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
+        force_world = np.zeros(3, dtype=float)
+        moment_com_world = np.zeros(3, dtype=float)
+        moment_normal_world = np.zeros(3, dtype=float)
+        moment_tangential_world = np.zeros(3, dtype=float)
+        moment_local_world = np.zeros(3, dtype=float)
+        normal_load_total = 0.0
+        contact_points_body = []
+        plate_wall_contact_count = 0
+        other_wall_contact_count = 0
+        contact_wrench = np.zeros(6, dtype=float)
+
+        for contact_index in range(self.data.ncon):
+            contact = self.data.contact[contact_index]
+            wall_in_contact = (
+                contact.geom1 == self.wall_geom_id
+                or contact.geom2 == self.wall_geom_id)
+            plate_is_geom1 = (
+                contact.geom1 == self.contact_plate_geom_id
+                and contact.geom2 == self.wall_geom_id)
+            plate_is_geom2 = (
+                contact.geom2 == self.contact_plate_geom_id
+                and contact.geom1 == self.wall_geom_id)
+            is_plate_wall = plate_is_geom1 or plate_is_geom2
+            if not is_plate_wall:
+                if wall_in_contact:
+                    other_wall_contact_count += 1
+                continue
+
+            mujoco.mj_contactForce(
+                self.model, self.data, contact_index, contact_wrench)
+            rotation_contact_world = np.asarray(
+                contact.frame, dtype=float).reshape(3, 3).T
+            torque_on_geom2_world = (
+                rotation_contact_world @ contact_wrench[3:])
+            sign_for_plate = (
+                1.0 if contact.geom2 == self.contact_plate_geom_id else -1.0)
+            force_normal_contact = np.array(
+                [contact_wrench[0], 0.0, 0.0], dtype=float)
+            force_tangential_contact = np.array(
+                [0.0, contact_wrench[1], contact_wrench[2]], dtype=float)
+            force_normal_plate_world = (
+                sign_for_plate
+                * rotation_contact_world
+                @ force_normal_contact
+            )
+            force_tangential_plate_world = (
+                sign_for_plate
+                * rotation_contact_world
+                @ force_tangential_contact
+            )
+            force_on_plate_world = (
+                force_normal_plate_world + force_tangential_plate_world)
+            torque_on_plate_world = sign_for_plate * torque_on_geom2_world
+            contact_pos_world = np.asarray(contact.pos, dtype=float)
+            lever_world = contact_pos_world - base_pos_world
+
+            force_world += force_on_plate_world
+            moment_normal_world += np.cross(
+                lever_world, force_normal_plate_world)
+            moment_tangential_world += np.cross(
+                lever_world, force_tangential_plate_world)
+            moment_local_world += torque_on_plate_world
+            normal_load_total += max(0.0, float(contact_wrench[0]))
+            contact_points_body.extend(
+                (rotation_world_body.T
+                 @ (contact_pos_world - base_pos_world)).tolist()
+            )
+            plate_wall_contact_count += 1
+
+        moment_com_world = (
+            moment_normal_world
+            + moment_tangential_world
+            + moment_local_world
+        )
+        force_body = rotation_world_body.T @ force_world
+        moment_com_body = rotation_world_body.T @ moment_com_world
+        moment_normal_body = rotation_world_body.T @ moment_normal_world
+        moment_tangential_body = (
+            rotation_world_body.T @ moment_tangential_world)
+        moment_local_body = rotation_world_body.T @ moment_local_world
+        wrench_msg = Wrench()
+        wrench_msg.force = force_body.astype(np.float32).tolist()
+        wrench_msg.moment = moment_com_body.astype(np.float32).tolist()
+        self.pub_contact_wrench_gt.publish(wrench_msg)
+        moment_center_body = (
+            moment_com_body
+            - np.cross(self.contact_center_body, force_body))
+        center_wrench_msg = Wrench()
+        center_wrench_msg.force = force_body.astype(np.float32).tolist()
+        center_wrench_msg.moment = (
+            moment_center_body.astype(np.float32).tolist())
+        self.pub_contact_wrench_center_gt.publish(center_wrench_msg)
+
+        count_msg = Int32()
+        count_msg.data = plate_wall_contact_count
+        self.pub_contact_count.publish(count_msg)
+        count_msg.data = other_wall_contact_count
+        self.pub_other_wall_contact_count.publish(count_msg)
+
+        points_msg = Float64MultiArray()
+        points_msg.data = contact_points_body
+        self.pub_contact_points_body.publish(points_msg)
+
+        if plate_wall_contact_count == 0:
+            contact_region = 0  # no plate/wall contact
+        else:
+            point_matrix = np.asarray(
+                contact_points_body, dtype=float).reshape(-1, 3)
+            centroid_z = float(np.mean(point_matrix[:, 2]))
+            if centroid_z < -0.02:
+                contact_region = 1  # lower edge
+            elif centroid_z > 0.02:
+                contact_region = 3  # upper edge
+            else:
+                contact_region = 2  # centered or both edges
+
+        sim_time = float(self.data.time)
+        if contact_region != self._last_contact_region:
+            self._contact_region_change_times.append(sim_time)
+            self._last_contact_region = contact_region
+        while (
+            self._contact_region_change_times
+            and self._contact_region_change_times[0] < sim_time - 1.0
+        ):
+            self._contact_region_change_times.popleft()
+
+        region_msg = Int32()
+        region_msg.data = contact_region
+        self.pub_contact_region.publish(region_msg)
+        zero_msg = Bool()
+        zero_msg.data = plate_wall_contact_count == 0
+        self.pub_zero_contact.publish(zero_msg)
+        rate_msg = Float64()
+        rate_msg.data = float(len(self._contact_region_change_times))
+        self.pub_contact_region_change_rate.publish(rate_msg)
+
+        for publisher, value in (
+            (self.pub_my_normal, moment_normal_body[1]),
+            (self.pub_my_tangential, moment_tangential_body[1]),
+            (self.pub_my_local, moment_local_body[1]),
+            (self.pub_my_contact_total, moment_com_body[1]),
+            (self.pub_contact_fn, normal_load_total),
+            (self.pub_contact_fz, force_body[2]),
+        ):
+            scalar_msg = Float64()
+            scalar_msg.data = float(value)
+            publisher.publish(scalar_msg)
+
+        # Signed distance from each plate corner to the near wall face.
+        # Positive: separated, zero: touching, negative: penetration.
+        wall_center_world = np.asarray(
+            self.data.xpos[self.wall_body_id], dtype=float)
+        rotation_world_wall = np.asarray(
+            self.data.xmat[self.wall_body_id], dtype=float).reshape(3, 3)
+        wall_outward_normal = -rotation_world_wall[:, 0]
+        wall_near_face = wall_center_world - 0.02 * rotation_world_wall[:, 0]
+        corner_gaps = []
+        for y_coord, z_coord in (
+            (self.cop_half_y, self.cop_half_z),
+            (-self.cop_half_y, self.cop_half_z),
+            (-self.cop_half_y, -self.cop_half_z),
+            (self.cop_half_y, -self.cop_half_z),
+        ):
+            corner_body = self.contact_center_body + np.array(
+                [0.0, y_coord, z_coord], dtype=float)
+            corner_world = (
+                base_pos_world + rotation_world_body @ corner_body)
+            corner_gaps.append(float(
+                np.dot(corner_world - wall_near_face, wall_outward_normal)))
+        gaps_msg = Float64MultiArray()
+        gaps_msg.data = corner_gaps
+        self.pub_plate_corner_gaps.publish(gaps_msg)
+
+        # Validation-only surface orientation error.  The wall and plate are
+        # parallel when WORLD-from-WALL^T * WORLD-from-BODY is identity.
+        relative_rotation = rotation_world_wall.T @ rotation_world_body
+        relative_msg = Float64MultiArray()
+        relative_msg.data = rotation_to_rpy(relative_rotation).tolist()
+        self.pub_relative_orientation_error.publish(relative_msg)
 
     # -------- Simulation loop --------
     def sim_loop(self):
+        try:
+            self._sim_loop_impl()
+        except RCLError:
+            # SIGINT invalidates the ROS context before the background thread
+            # necessarily finishes its current publish batch.
+            if rclpy.ok() and not self._stop:
+                raise
+
+    def _sim_loop_impl(self):
         next_step = time.perf_counter()
         next_pub = next_step
 
@@ -399,16 +830,6 @@ class PlantRosNode(Node):
                     vel_W  = self._noisy(self._sensing(self.sid_vel),  SIG_VEL)
 
                     rpy = quat_to_rpy(quat_W)
-
-                    # COM debug print (optional)
-                    if (now - self._last_com_print_t) >= COM_PRINT_PERIOD_S:
-                        com_W = np.array(self.data.subtree_com[self.base_body_id], dtype=float)
-                        R_WB = rpy_to_R_WB(rpy)
-                        pc_B = R_WB.T @ (com_W - pos_W)
-                        self.get_logger().info(
-                            f"pc_B = [{pc_B[0]:.4f}, {pc_B[1]:.4f}, {pc_B[2]:.4f}]"
-                        )
-                        self._last_com_print_t = now
 
                     servo = self._noisy(
                         np.array([self._sensing(sid)[0] for sid in self.sid_servo_ang], dtype=float),
@@ -456,6 +877,7 @@ class PlantRosNode(Node):
                     actuation_wrench_msg.moment = actuation_moment_B.astype(np.float32).tolist()
                     self.pub_actuation_wrench_body.publish(actuation_wrench_msg)
                     self._publish_cop_real()
+                    self._plate_wall_contact_debug()
                     self._publish_palm_pose()
                     next_pub += 1.0 / PHYSICS_HZ
 
@@ -463,17 +885,157 @@ class PlantRosNode(Node):
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
+    def _viewer_key_callback(self, keycode):
+        """Toggle plate contact-force arrows when F is pressed."""
+        if keycode != ord("F"):
+            return
+        self.viewer_contact_force_enabled = (
+            not self.viewer_contact_force_enabled)
+        state = "ON" if self.viewer_contact_force_enabled else "OFF"
+        self.get_logger().info(
+            f"[viewer] plate contact-force arrows {state} (F=toggle)")
+
+    def _plate_contact_resultant_world(self):
+        """Return wall-on-plate force applied at the published real CoP."""
+        force_world = np.zeros(3, dtype=float)
+        contact_wrench = np.zeros(6, dtype=float)
+
+        for contact_index in range(self.data.ncon):
+            contact = self.data.contact[contact_index]
+            plate_is_geom1 = (
+                contact.geom1 == self.contact_plate_geom_id
+                and contact.geom2 == self.wall_geom_id)
+            plate_is_geom2 = (
+                contact.geom2 == self.contact_plate_geom_id
+                and contact.geom1 == self.wall_geom_id)
+            if not (plate_is_geom1 or plate_is_geom2):
+                continue
+
+            mujoco.mj_contactForce(
+                self.model, self.data, contact_index, contact_wrench)
+            rotation_contact_world = np.asarray(
+                contact.frame, dtype=float).reshape(3, 3).T
+            # MuJoCo's extracted contact wrench follows the geom2 sign in this
+            # contact frame. Negate it when the plate is geom1 so the arrow
+            # always represents the wall force acting on the drone plate.
+            plate_sign = 1.0 if plate_is_geom2 else -1.0
+            force_on_plate_world = (
+                plate_sign
+                * rotation_contact_world
+                @ contact_wrench[:3]
+            )
+            force_world += force_on_plate_world
+
+        # Use exactly the same corner-load calculation as /minitrone/cop_real.
+        # The point is projected onto the nominal contact face x_C=0, so
+        # MuJoCo penetration depth cannot move the arrow origin along x_C.
+        cop = self._cop_from_corner_loads(self._measured_corner_loads())
+        if cop is None:
+            return None
+        _, cop_y, cop_z = cop
+        rotation_world_contact, contact_center_world = (
+            self._contact_plate_frame_world()
+        )
+        cop_world = (
+            contact_center_world
+            + rotation_world_contact
+            @ np.array([0.0, cop_y, cop_z], dtype=float)
+        )
+        return cop_world, force_world
+
+    def _update_viewer_contact_force_arrow(self, viewer):
+        """Populate the viewer user scene with the plate resultant-force arrow."""
+        viewer.user_scn.ngeom = 0
+        if not self.viewer_contact_force_enabled:
+            return
+
+        resultant = self._plate_contact_resultant_world()
+        if resultant is None or viewer.user_scn.maxgeom < 1:
+            return
+        origin_world, force_world = resultant
+        force_norm = float(np.linalg.norm(force_world))
+        if force_norm <= 1e-6:
+            return
+
+        arrow_length = min(
+            0.50,
+            self.viewer_contact_force_scale * force_norm,
+        )
+        arrow_end_world = (
+            origin_world + arrow_length * force_world / force_norm)
+        arrow_geom = viewer.user_scn.geoms[0]
+        mujoco.mjv_initGeom(
+            arrow_geom,
+            mujoco.mjtGeom.mjGEOM_ARROW,
+            np.zeros(3, dtype=float),
+            np.zeros(3, dtype=float),
+            np.eye(3, dtype=float).reshape(-1),
+            np.array([1.0, 0.15, 0.05, 0.95], dtype=np.float32),
+        )
+        mujoco.mjv_connector(
+            arrow_geom,
+            mujoco.mjtGeom.mjGEOM_ARROW,
+            self.viewer_contact_force_width,
+            origin_world,
+            arrow_end_world,
+        )
+        arrow_geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+        viewer.user_scn.ngeom = 1
+
+    def _set_viewer_status_text(self, viewer):
+        """Show the force-arrow shortcut and current state in the viewer."""
+        state = "ON" if self.viewer_contact_force_enabled else "OFF"
+        viewer.set_texts((
+            mujoco.mjtFontScale.mjFONTSCALE_100,
+            mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            "F: CoP contact-force arrow",
+            state,
+        ))
+
+    def _configure_viewer_options(self, viewer):
+        """Apply this simulation's default viewer visibility groups."""
+        # Propeller discs and blades use visual geom groups 1~4. MuJoCo leaves
+        # some of these groups disabled by default.
+        last_prop_group = min(5, len(viewer.opt.geomgroup))
+        viewer.opt.geomgroup[1:last_prop_group] = (
+            self.viewer_show_propellers)
+
     def viewer_loop(self):
         try:
-            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            with mujoco.viewer.launch_passive(
+                self.model,
+                self.data,
+                key_callback=self._viewer_key_callback,
+            ) as viewer:
+                with viewer.lock():
+                    self._configure_viewer_options(viewer)
+                self._set_viewer_status_text(viewer)
+                previous_force_arrow_state = (
+                    self.viewer_contact_force_enabled)
                 while viewer.is_running() and rclpy.ok() and not self._stop:
+                    force_arrow_state_changed = False
                     with self._lock:
-                        viewer.sync()
+                        with viewer.lock():
+                            self._update_viewer_contact_force_arrow(viewer)
+                        force_arrow_state_changed = (
+                            previous_force_arrow_state
+                            != self.viewer_contact_force_enabled)
+                    if force_arrow_state_changed:
+                        self._set_viewer_status_text(viewer)
+                        previous_force_arrow_state = (
+                            self.viewer_contact_force_enabled)
+                    viewer.sync()
         except Exception as e:
             self.get_logger().warn(f"[viewer] ended: {e}")
 
     def close(self):
         self._stop = True
+        if (
+            hasattr(self, "sim_thread")
+            and self.sim_thread.is_alive()
+            and threading.current_thread() is not self.sim_thread
+        ):
+            self.sim_thread.join(timeout=1.0)
 
 
 def main():
@@ -481,10 +1043,13 @@ def main():
     node = PlantRosNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.close()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
