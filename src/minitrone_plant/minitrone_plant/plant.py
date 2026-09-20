@@ -1002,11 +1002,15 @@ class PlantRosNode(Node):
 
     def viewer_loop(self):
         try:
-            with mujoco.viewer.launch_passive(
-                self.model,
-                self.data,
-                key_callback=self._viewer_key_callback,
-            ) as viewer:
+            # launch_passive runs mj_forward and loads the shared mjData.
+            # Exclude physics updates until viewer initialization completes.
+            with self._lock:
+                viewer = mujoco.viewer.launch_passive(
+                    self.model,
+                    self.data,
+                    key_callback=self._viewer_key_callback,
+                )
+            with viewer:
                 with viewer.lock():
                     self._configure_viewer_options(viewer)
                 self._set_viewer_status_text(viewer)
@@ -1020,11 +1024,14 @@ class PlantRosNode(Node):
                         force_arrow_state_changed = (
                             previous_force_arrow_state
                             != self.viewer_contact_force_enabled)
+                        # sync copies shared mjData and applies GUI inputs.
+                        # It takes the viewer lock internally, but also needs
+                        # our physics lock to exclude concurrent mj_step.
+                        viewer.sync()
                     if force_arrow_state_changed:
                         self._set_viewer_status_text(viewer)
                         previous_force_arrow_state = (
                             self.viewer_contact_force_enabled)
-                    viewer.sync()
         except Exception as e:
             self.get_logger().warn(f"[viewer] ended: {e}")
 
