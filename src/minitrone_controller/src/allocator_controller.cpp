@@ -2,6 +2,7 @@
 #include <minitrone_interfaces/msg/wrench.hpp>
 #include <minitrone_interfaces/msg/input.hpp>
 #include <minitrone_interfaces/msg/minitrone_state.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <limits>
 #include <Eigen/Dense>
@@ -47,6 +48,10 @@ public:
     sub_state_ = this->create_subscription<minitrone_interfaces::msg::MinitroneState>("/minitrone/state", 10, std::bind(&AllocatorController::onState, this, std::placeholders::_1));
 
     pub_input_ = this->create_publisher<minitrone_interfaces::msg::Input>("/minitrone/input", 10);
+    pub_allocated_wrench_ = this->create_publisher<minitrone_interfaces::msg::Wrench>(
+      "/minitrone/allocated_wrench_estimate", 10);
+    pub_saturated_ = this->create_publisher<std_msgs::msg::Bool>(
+      "/minitrone/allocator_saturated", 10);
 
     dt_buffer_.assign(buffer_size, 0.01);
     dt_sum_ = 0.01 * static_cast<double>(buffer_size);
@@ -143,6 +148,11 @@ private:
     C1_ = C1_final_raw
         .cwiseMax(0.0)
         .cwiseMin(max_motor_thrust);
+    std_msgs::msg::Bool saturated;
+    saturated.data = (C1_ - C1_final_raw).cwiseAbs().maxCoeff() > 1e-6 ||
+      (C2_des_ - C2_cmd).cwiseAbs().maxCoeff() > 1e-6 ||
+      std::abs(tauz_r - tauz_r_sat) > 1e-6;
+    pub_saturated_->publish(saturated);
 
     minitrone_interfaces::msg::Input out;
 
@@ -158,6 +168,20 @@ private:
     out.u[3] = std::clamp(motor_speed[3], 0.0, max_motor_speed);
     out.u[4] = C2_cmd(0); out.u[5] = C2_cmd(1); out.u[6] = C2_cmd(2); out.u[7] = C2_cmd(3);
     pub_input_->publish(out);
+
+    // Predicted wrench of the saturated actuator commands, using the same
+    // allocation matrices. This is a command estimate, before plant dynamics.
+    const Eigen::Vector4d b1_allocated = A1_cmd * C1_;
+    const Eigen::Vector4d b2_allocated =
+      calc_A2(C1_, C2_mea_) * C2_cmd.array().sin().matrix();
+    minitrone_interfaces::msg::Wrench allocated;
+    allocated.moment[0] = b1_allocated[0];
+    allocated.moment[1] = b1_allocated[1];
+    allocated.moment[2] = b1_allocated[2] + b2_allocated[2];
+    allocated.force[0] = b2_allocated[0];
+    allocated.force[1] = b2_allocated[1];
+    allocated.force[2] = b1_allocated[3];
+    pub_allocated_wrench_->publish(allocated);
 
     if (this->get_parameter("enable_saturation_debug").as_bool()) {
       maybeLogAllocatorLimit(
@@ -318,6 +342,8 @@ private:
   rclcpp::Subscription<minitrone_interfaces::msg::Wrench>::SharedPtr          sub_wrench_;
   rclcpp::Subscription<minitrone_interfaces::msg::MinitroneState>::SharedPtr sub_state_;
   rclcpp::Publisher<minitrone_interfaces::msg::Input>::SharedPtr              pub_input_;
+  rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr             pub_allocated_wrench_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                           pub_saturated_;
 
   rclcpp::Time last_callback_time_;
   std::vector<double> dt_buffer_;

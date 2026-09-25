@@ -300,41 +300,17 @@ The current implementation assigns `o` to the sinusoidal Mx disturbance. There i
 
 ### `minitrone_wrench_controller` — Position and attitude control
 
-Computes body-frame force and moment commands on `/minitrone/wrench_cmd` using cascaded position/velocity PID, attitude control, and gravity compensation. Control updates are triggered by fresh state messages. When admittance control is active, it uses the corresponding position and attitude references.
+Computes body-frame force and moment commands on `/minitrone/wrench_cmd` through four independent PID layers: position → velocity → force and attitude → angular rate → torque. The existing allocator then converts the 6-DoF wrench to four BLDC and four servo commands. Control updates are triggered by fresh state messages.
 
 ```bash
 ros2 run minitrone_controller minitrone_wrench_controller
 ```
 
-Default parameters are `mass=2.5` kg and `gravity=9.81` m/s².
-
-The translation cascade runs entirely in the world frame:
-`position reference → position PID → velocity reference → velocity PID → acceleration reference`.
-The published body force is `R_WBᵀ · mass · (acceleration reference + [0, 0, gravity])`.
-Attitude control, wrench topics, allocator/passive-alignment interfaces, and admittance
-reference selection are unchanged. Both cascade integrators reset on admittance transitions.
-
-Startup parameters are `position_kp_x`, `position_ki_x`, `position_kd_x`,
-`velocity_kp_x`, `velocity_ki_x`, `velocity_kd_x` (also `_y` and `_z`).
-Defaults split the old force PID into an outer PI and inner P, reproducing its
-force law, integral clamps, and ±200 N per-world-axis feedback limit:
-
-| Gain | x / y | z |
-| --- | --- | --- |
-| Position Kp | 28 / 6 | 24 / 10 |
-| Position Ki | 1.5 / 6 | 1.2 / 10 |
-| Position Kd | 0 | 0 |
-| Velocity Kp | 6 / mass | 10 / mass |
-| Velocity Ki / Kd | 0 / 0 | 0 / 0 |
-
-`velocity_limit_x/y/z` optionally clamps the outer-loop speed output in m/s;
-zero (default) disables this clamp to preserve the original response. Position
-integral limits are `[-5, 100] / old_Kd` m/s; velocity integral limits are
-`[-5, 100] / mass` m/s². With custom gains, these fixed bounds still apply.
-Derivative terms use measured velocity (outer) and finite differences of world
-velocity (inner), avoiding reference-step derivative kicks and the different
-`state.acc` conventions in legacy and high-fidelity simulation. Inner Kd defaults
-to zero; enabling it with noisy or held velocity measurements requires tuning.
+Default parameters are `mass=2.86` kg and `gravity=9.81` m/s². All 36 scalar
+P/I/D gains have independent ROS parameters and can be changed while running.
+See [CONTROLLER.md](CONTROLLER.md) for the hardware PX4 comparison, all 36
+initial values, equations, frames, limits, anti-windup, diagnostic topics, and
+tuning instructions.
 
 
 ### `minitrone_allocator_controller` — Actuator allocation
@@ -455,6 +431,9 @@ ros2 run minitrone_cmd minitrone_position_teleop
 | `/minitrone/att_ref` | Effective attitude reference used by the wrench controller, `AttitudeCmd` in degrees; publishes `(0, 0, 0)` during ordinary flight when no attitude command has arrived |
 | `/minitrone/att_cmd_admittance` | Admittance attitude offset in degrees; added to `/minitrone/att_cmd` only while admittance is active |
 | `/minitrone/wrench_cmd` | Commanded control forces and moments |
+| `/minitrone/allocated_wrench_estimate` | Predicted wrench from saturated allocator commands, before plant dynamics |
+| `/minitrone/allocator_saturated` | Allocator limit flag used to freeze controller integrators |
+| `/minitrone/controller_debug/{position,velocity,attitude,rate}` | Seven XYZ triples per layer: setpoint, measured, error, P, I, D, output |
 | `/minitrone/input` | Motor and servo commands |
 | `/minitrone/state` | Plant state |
 | `/minitrone/mob_observer_input` | Bundled state and actuation input for wrench observers |

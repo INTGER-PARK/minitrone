@@ -4,6 +4,8 @@
 #include <minitrone_interfaces/msg/wrench.hpp>
 #include <minitrone_interfaces/msg/attitude_cmd.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -12,6 +14,85 @@
 #include <string>
 #include <limits>
 #include <stdexcept>
+#include <array>
+#include <tuple>
+#include <vector>
+
+namespace {
+// Twelve axis rows are the single source of all 36 independently declared ROS
+// PID gains. PX4 names use MPC_* and MC_*; these explicit layer/axis names avoid
+// the PX4 firmware's shared XY parameters and expose the requested full PID.
+struct GainRow { const char * layer; const char * axis; double kp, ki, kd; };
+constexpr std::array<GainRow, 12> kGainDefaults{{
+  {"POS", "X", 28.0/6.0, 1.5/6.0, 0.01},
+  {"POS", "Y", 28.0/6.0, 1.5/6.0, 0.01},
+  {"POS", "Z", 24.0/10.0, 1.2/10.0, 0.01},
+  {"VEL", "X", 6.0/2.86, 0.01, 0.01},
+  {"VEL", "Y", 6.0/2.86, 0.01, 0.01},
+  {"VEL", "Z", 10.0/2.86, 0.01, 0.01},
+  {"ATT", "ROLL", 6.0, 0.02, 0.8},
+  {"ATT", "PITCH", 6.0, 0.02, 0.8},
+  {"ATT", "YAW", 6.0, 0.02, 0.8},
+  {"RATE", "ROLL", 1.0, 0.001, 0.001},
+  {"RATE", "PITCH", 1.0, 0.001, 0.001},
+  {"RATE", "YAW", 1.0, 0.001, 0.001},
+}};
+static_assert(kGainDefaults.size() * 3 == 36, "four 3-axis PID layers require 36 gains");
+
+struct PidLayer {
+  Eigen::Vector3d kp{Eigen::Vector3d::Zero()}, ki{Eigen::Vector3d::Zero()}, kd{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d integral{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d error{Eigen::Vector3d::Zero()}, p{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d i{Eigen::Vector3d::Zero()}, d{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d output{Eigen::Vector3d::Zero()};
+
+  void reset() { integral.setZero(); error.setZero(); p.setZero(); i.setZero(); d.setZero(); output.setZero(); }
+
+  Eigen::Vector3d update(const Eigen::Vector3d & e, const Eigen::Vector3d & measured_derivative,
+                         double dt, const Eigen::Vector3d & out_limit,
+                         const Eigen::Vector3d & integral_limit, bool allow_integration)
+  {
+    // PX4-inspired derivative on measurement avoids setpoint kicks. The caller
+    // low-pass filters measured derivatives before passing them to this layer.
+    error = e;
+    p = kp.cwiseProduct(e);
+    d = -kd.cwiseProduct(measured_derivative);
+    for (int a = 0; a < 3; ++a) {
+      const double candidate = std::clamp(integral[a] + e[a] * dt,
+                                          -integral_limit[a], integral_limit[a]);
+      const double unsaturated = p[a] + ki[a] * candidate + d[a];
+      // Conditional integration: stop accumulating into an output limit.
+      if (allow_integration && !((unsaturated > out_limit[a] && e[a] > 0.0) ||
+            (unsaturated < -out_limit[a] && e[a] < 0.0))) {
+        integral[a] = candidate;
+      }
+      i[a] = ki[a] * integral[a];
+      output[a] = std::clamp(p[a] + i[a] + d[a], -out_limit[a], out_limit[a]);
+    }
+    return output;
+  }
+};
+
+Eigen::Matrix3d rotationWorldFromBody(const Eigen::Vector3d & rpy)
+{
+  // MuJoCo framequat is wxyz and maps body to world. State.rpy is XYZ Euler
+  // extracted from it, so R_WB = Rz(yaw) Ry(pitch) Rx(roll).
+  return (Eigen::AngleAxisd(rpy.z(), Eigen::Vector3d::UnitZ()) *
+          Eigen::AngleAxisd(rpy.y(), Eigen::Vector3d::UnitY()) *
+          Eigen::AngleAxisd(rpy.x(), Eigen::Vector3d::UnitX())).toRotationMatrix();
+}
+
+Eigen::Vector3d attitudeErrorBody(const Eigen::Matrix3d & desired,
+                                  const Eigen::Matrix3d & actual)
+{
+  // PX4 uses 2*imag(q_current^{-1} q_desired), canonicalizing the quaternion
+  // to select the shortest rotation. The error is expressed in body axes.
+  Eigen::Quaterniond q(actual.transpose() * desired);
+  q.normalize();
+  if (q.w() < 0.0) q.coeffs() *= -1.0;
+  return 2.0 * q.vec();
+}
+}  // namespace
 
 class WrenchController : public rclcpp::Node
 {
@@ -22,7 +103,7 @@ public:
   {
     // ===================== (MINITRONE) params =====================
     // 
-    this->declare_parameter<double>("mass", 2.5);
+    this->declare_parameter<double>("mass", 2.86);
     this->declare_parameter<double>("gravity", 9.81);
     mass_ = this->get_parameter("mass").as_double();
     grav_ = this->get_parameter("gravity").as_double();
@@ -31,74 +112,33 @@ public:
       throw std::invalid_argument("mass must be positive and gravity must be finite");
     }
 
-    // Legacy force gains define the equivalent default cascade tuning.
-    const double KP_POS[3] = {28.0, 28.0, 24.0};
-    const double KI_POS[3] = {1.5, 1.5, 1.2};
-    const double KD_POS[3] = {6.0, 6.0, 10.0};
-    const double I_MIN_POS = -5.0, I_MAX_POS = 100.0, OUT_MIN_POS = -200.0, OUT_MAX_POS = 200.0;
-
-    const double KP_ATT[3] = {6.00, 6.00, 6.00};
-    const double KI_ATT[3] = {0.00, 0.00, 0.00};
-    const double KD_ATT[3] = {0.80, 0.80, 0.80};
-    const double I_MIN_ATT = -1.0, I_MAX_ATT = 1.0, OUT_MIN_ATT = -5.0, OUT_MAX_ATT = 5.0;
-
-    auto init_pid =
-      [](double kp, double ki, double kd,
-         double i_min, double i_max,
-         double out_min, double out_max)
-      -> std::function<double(double,double,double,double,bool)>
-    {
-      double iacc = 0.0;
-      return [=](double ref, double cur, double dcur, double dt, bool reset) mutable
-      {
-        // [ADMITTANCE 연동 최소 수정 1]
-        // Admittance ON/OFF 전환 시 이전 위치 PID에 누적된 적분값이 남아 있으면,
-        // OFF 순간 현재 pose를 reference로 받아도 잔류 force/moment가 발생할 수 있다.
-        // 따라서 mode 전환 직후 한 제어 주기 동안 각 PID의 적분 상태만 0으로 만든다.
-        if (reset) iacc = 0.0;
-
-        if (dt <= 0.0) dt = 1e-3;
-        const double e  = ref - cur;
-        const double de = -dcur;
-        iacc += ki * e * dt;
-        iacc = std::clamp(iacc, i_min, i_max);
-        double u = kp*e + iacc + kd*de;
-        return std::clamp(u, out_min, out_max);
-      };
-    };
-
-    const char * axes[] = {"x", "y", "z"};
-    auto gain = [this](const std::string & name, double value) {
-      const double result = declare_parameter<double>(name, value);
-      if (!std::isfinite(result) || result < 0.0) {
-        throw std::invalid_argument(name + " must be finite and nonnegative");
-      }
-      return result;
-    };
-    for (int axis = 0; axis < 3; ++axis) {
-      const std::string suffix = std::string("_") + axes[axis];
-      // v_ref = (Kp_old / Kd_old) e + integral(Ki_old / Kd_old e).
-      // a_ref = (Kd_old / mass) (v_ref - v_world).
-      // Thus mass * a_ref reproduces the old force PID with default gains.
-      const double pos_kp = gain("position_kp" + suffix, KP_POS[axis] / KD_POS[axis]);
-      const double pos_ki = gain("position_ki" + suffix, KI_POS[axis] / KD_POS[axis]);
-      const double pos_kd = gain("position_kd" + suffix, 0.0);
-      const double vel_kp = gain("velocity_kp" + suffix, KD_POS[axis] / mass_);
-      const double vel_ki = gain("velocity_ki" + suffix, 0.0);
-      const double vel_kd = gain("velocity_kd" + suffix, 0.0);
-      // Zero disables the optional speed limit to retain the legacy force law.
-      const double speed_limit = gain("velocity_limit" + suffix, 0.0);
-      const double vmax = speed_limit > 0.0 ? speed_limit :
-        std::numeric_limits<double>::infinity();
-      pid_pos_[axis] = init_pid(pos_kp, pos_ki, pos_kd,
-        I_MIN_POS / KD_POS[axis], I_MAX_POS / KD_POS[axis], -vmax, vmax);
-      pid_vel_[axis] = init_pid(vel_kp, vel_ki, vel_kd,
-        I_MIN_POS / mass_, I_MAX_POS / mass_, OUT_MIN_POS / mass_, OUT_MAX_POS / mass_);
+    // All gains are explicitly declared here, one scalar per layer/axis/term.
+    // Initial values retain the old MuJoCo translation gain product and
+    // attitude torque scale; the newly added I/D terms are conservative.
+    for (std::size_t row = 0; row < kGainDefaults.size(); ++row) {
+      const auto & spec = kGainDefaults[row];
+      PidLayer & layer = layers_[row / 3];
+      const int axis = static_cast<int>(row % 3);
+      const std::string suffix = std::string("_") + spec.layer + "_" + spec.axis;
+      layer.kp[axis] = declareGain("KP" + suffix, spec.kp);
+      layer.ki[axis] = declareGain("KI" + suffix, spec.ki);
+      layer.kd[axis] = declareGain("KD" + suffix, spec.kd);
     }
-
-    pid_att_[0] = init_pid(KP_ATT[0], KI_ATT[0], KD_ATT[0], I_MIN_ATT, I_MAX_ATT, OUT_MIN_ATT, OUT_MAX_ATT);
-    pid_att_[1] = init_pid(KP_ATT[1], KI_ATT[1], KD_ATT[1], I_MIN_ATT, I_MAX_ATT, OUT_MIN_ATT, OUT_MAX_ATT);
-    pid_att_[2] = init_pid(KP_ATT[2], KI_ATT[2], KD_ATT[2], I_MIN_ATT, I_MAX_ATT, OUT_MIN_ATT, OUT_MAX_ATT);
+    velocity_limit_ << declarePositive("velocity_limit_x", 2.0),
+      declarePositive("velocity_limit_y", 2.0), declarePositive("velocity_limit_z", 1.0);
+    acceleration_limit_ << declarePositive("acceleration_limit_x", 20.0),
+      declarePositive("acceleration_limit_y", 20.0), declarePositive("acceleration_limit_z", 20.0);
+    rate_limit_ << declarePositive("rate_limit_roll", 4.0),
+      declarePositive("rate_limit_pitch", 4.0), declarePositive("rate_limit_yaw", 3.0);
+    torque_limit_ << declarePositive("torque_limit_roll", 5.0),
+      declarePositive("torque_limit_pitch", 5.0), declarePositive("torque_limit_yaw", 5.0);
+    pos_integral_limit_ = declarePositive("position_integral_limit", 10.0);
+    vel_integral_limit_ = declarePositive("velocity_integral_limit", 10.0);
+    att_integral_limit_ = declarePositive("attitude_integral_limit", 1.0);
+    rate_integral_limit_ = declarePositive("rate_integral_limit", 1.0);
+    derivative_cutoff_hz_ = declarePositive("derivative_cutoff_hz", 30.0);
+    gain_callback_ = add_on_set_parameters_callback(
+      std::bind(&WrenchController::onGainParameters, this, std::placeholders::_1));
 
     const std::string cmd_topic =
       declare_parameter<std::string>("cmd_topic", "/minitrone/cmd");
@@ -133,12 +173,25 @@ public:
     sub_admittance_active_ = this->create_subscription<std_msgs::msg::Bool>(
       admittance_active_topic, 10,
       std::bind(&WrenchController::onAdmittanceActive, this, std::placeholders::_1));
+    sub_reset_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/minitrone/controller_reset", 10,
+      [this](const std_msgs::msg::Bool::SharedPtr msg) { if (msg->data) resetControllers(); });
+    sub_allocator_saturated_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/minitrone/allocator_saturated", 10,
+      [this](const std_msgs::msg::Bool::SharedPtr msg) { allocator_saturated_ = msg->data; });
 
     // The passive-aligning filter consumes the conventional controller output.
     pub_wrench_ = this->create_publisher<minitrone_interfaces::msg::Wrench>(
       "/minitrone/wrench_cmd", 10);
     pub_att_ref_ = this->create_publisher<minitrone_interfaces::msg::AttitudeCmd>(
       "/minitrone/att_ref", 10);
+    const std::array<const char *, 4> names{{"position", "velocity", "attitude", "rate"}};
+    for (std::size_t n = 0; n < names.size(); ++n) {
+      debug_pubs_[n] = create_publisher<std_msgs::msg::Float64MultiArray>(
+        std::string("/minitrone/controller_debug/") + names[n], 10);
+    }
+    pub_wrench_debug_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/minitrone/controller_debug/wrench", 10);
 
     pos_cmd_.setZero();
     att_cmd_.setZero();
@@ -146,12 +199,83 @@ public:
   }
 
 private:
+  rcl_interfaces::msg::SetParametersResult onGainParameters(
+    const std::vector<rclcpp::Parameter> & parameters)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    std::vector<std::tuple<std::size_t, int, int, double>> changes;
+    for (const auto & parameter : parameters) {
+      for (std::size_t row = 0; row < kGainDefaults.size(); ++row) {
+        const auto & spec = kGainDefaults[row];
+        const std::string suffix = std::string("_") + spec.layer + "_" + spec.axis;
+        const std::array<std::string, 3> names{{"KP" + suffix, "KI" + suffix, "KD" + suffix}};
+        for (int term = 0; term < 3; ++term) {
+          if (parameter.get_name() != names[term]) continue;
+          if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+              !std::isfinite(parameter.as_double()) || parameter.as_double() < 0.0) {
+            result.successful = false;
+            result.reason = parameter.get_name() + " must be finite and nonnegative double";
+            return result;
+          }
+          changes.emplace_back(row / 3, static_cast<int>(row % 3), term, parameter.as_double());
+        }
+      }
+    }
+    for (const auto & [layer, axis, term, value] : changes) {
+      if (term == 0) layers_[layer].kp[axis] = value;
+      if (term == 1) layers_[layer].ki[axis] = value;
+      if (term == 2) layers_[layer].kd[axis] = value;
+    }
+    if (!changes.empty()) resetControllers();
+    return result;
+  }
+
+  double declareGain(const std::string & name, double value)
+  {
+    const double result = declare_parameter<double>(name, value);
+    if (!std::isfinite(result) || result < 0.0) {
+      throw std::invalid_argument(name + " must be finite and nonnegative");
+    }
+    return result;
+  }
+
+  double declarePositive(const std::string & name, double value)
+  {
+    const double result = declareGain(name, value);
+    if (result <= 0.0) throw std::invalid_argument(name + " must be positive");
+    return result;
+  }
+
+  void resetControllers()
+  {
+    // Reset all four integral and derivative states on mode transitions,
+    // explicit reset, and clock discontinuity (including simulation reset).
+    for (auto & layer : layers_) layer.reset();
+    derivative_initialized_ = false;
+    filtered_vel_.setZero(); filtered_accel_.setZero();
+    filtered_rate_.setZero(); filtered_alpha_.setZero();
+  }
+
+  void publishLayerDebug(std::size_t index, const Eigen::Vector3d & setpoint,
+                         const Eigen::Vector3d & measured)
+  {
+    const auto & l = layers_[index];
+    std_msgs::msg::Float64MultiArray msg;
+    // Seven consecutive XYZ triples: setpoint, measured, error, P, I, D, output.
+    for (const auto & v : {setpoint, measured, l.error, l.p, l.i, l.d, l.output}) {
+      for (int a = 0; a < 3; ++a) msg.data.push_back(v[a]);
+    }
+    debug_pubs_[index]->publish(msg);
+  }
+
   void onCmd(const minitrone_interfaces::msg::Cmd::SharedPtr msg)
   {
     const Eigen::Vector3d incoming_cmd(
       static_cast<double>(msg->pos_cmd[0]),
       static_cast<double>(msg->pos_cmd[1]),
       static_cast<double>(msg->pos_cmd[2]));
+    if (!incoming_cmd.allFinite()) return;
     if (waiting_for_position_sync_) {
       if ((incoming_cmd - pos_cmd_).norm() > position_sync_tolerance_) {
         return;
@@ -165,26 +289,32 @@ private:
 
   void onAdmittanceCmd(const minitrone_interfaces::msg::Cmd::SharedPtr msg)
   {
-    admittance_pos_cmd_ << static_cast<double>(msg->pos_cmd[0]),
-                          static_cast<double>(msg->pos_cmd[1]),
-                          static_cast<double>(msg->pos_cmd[2]);
+    const Eigen::Vector3d incoming(static_cast<double>(msg->pos_cmd[0]),
+                                   static_cast<double>(msg->pos_cmd[1]),
+                                   static_cast<double>(msg->pos_cmd[2]));
+    if (!incoming.allFinite()) return;
+    admittance_pos_cmd_ = incoming;
     have_admittance_cmd_ = true;
   }
 
   void onAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
   {
     // minitrone_cmd publishes attitude commands in degrees.
-    att_cmd_ << static_cast<double>(msg->roll_ref) * deg_to_rad,
-                static_cast<double>(msg->pitch_ref) * deg_to_rad,
-                static_cast<double>(msg->yaw_ref) * deg_to_rad;
+    const Eigen::Vector3d incoming(static_cast<double>(msg->roll_ref) * deg_to_rad,
+                                   static_cast<double>(msg->pitch_ref) * deg_to_rad,
+                                   static_cast<double>(msg->yaw_ref) * deg_to_rad);
+    if (!incoming.allFinite()) return;
+    att_cmd_ = incoming;
     have_att_cmd_ = true;
   }
 
   void onAdmittanceAttCmd(const minitrone_interfaces::msg::AttitudeCmd::SharedPtr msg)
   {
-    admittance_att_cmd_ << static_cast<double>(msg->roll_ref) * deg_to_rad,
-                          static_cast<double>(msg->pitch_ref) * deg_to_rad,
-                          static_cast<double>(msg->yaw_ref) * deg_to_rad;
+    const Eigen::Vector3d incoming(static_cast<double>(msg->roll_ref) * deg_to_rad,
+                                   static_cast<double>(msg->pitch_ref) * deg_to_rad,
+                                   static_cast<double>(msg->yaw_ref) * deg_to_rad);
+    if (!incoming.allFinite()) return;
+    admittance_att_cmd_ = incoming;
     have_admittance_att_cmd_ = true;
   }
 
@@ -218,6 +348,12 @@ private:
     rpy_    << static_cast<double>(msg->rpy[0]),   static_cast<double>(msg->rpy[1]),   static_cast<double>(msg->rpy[2]);
     w_body_ << static_cast<double>(msg->w_rpy[0]), static_cast<double>(msg->w_rpy[1]), static_cast<double>(msg->w_rpy[2]);
 
+    if (!pos_.allFinite() || !vel_.allFinite() || !rpy_.allFinite() || !w_body_.allFinite()) {
+      resetControllers();
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "non-finite state rejected");
+      return;
+    }
+
     have_state_ = true;
     tryPublish();
   }
@@ -237,44 +373,46 @@ private:
     const Eigen::Vector3d pos_ref =
       use_admittance ? admittance_pos_cmd_ : (have_cmd_ ? pos_cmd_ : pos_);
 
-    // Mode 전환 직후 모든 PID 적분기를 같은 제어 주기에 한 번만 초기화한다.
-    const bool reset_pid = reset_pid_pending_;
-    reset_pid_pending_ = false;
-
-    // Position and velocity are world-frame quantities. Differentiate measured
-    // world velocity for the optional inner D term: state.acc is body-frame IMU
-    // specific force, not world-frame kinematic acceleration. Reset derivative
-    // history on mode changes, first sample, or a timing discontinuity.
-    const Eigen::Vector3d acceleration_world =
-      have_previous_velocity_ && valid_dt && !reset_pid ?
-      Eigen::Vector3d((vel_ - previous_velocity_) / dt) : Eigen::Vector3d::Zero();
-    previous_velocity_ = vel_;
-    have_previous_velocity_ = true;
-
-    Eigen::Vector3d velocity_ref_world;
-    Eigen::Vector3d acceleration_ref_world;
-    for (int axis = 0; axis < 3; ++axis) {
-      velocity_ref_world[axis] = pid_pos_[axis](
-        pos_ref[axis], pos_[axis], vel_[axis], dt, reset_pid);
-      acceleration_ref_world[axis] = pid_vel_[axis](
-        velocity_ref_world[axis], vel_[axis], acceleration_world[axis], dt, reset_pid);
+    if (reset_pid_pending_ || !valid_dt) {
+      resetControllers();
+      reset_pid_pending_ = false;
     }
 
-    Eigen::Vector3d F_world = mass_ * acceleration_ref_world;
-    F_world.z() += mass_ * grav_;
+    // The simulator publishes world position/velocity, XYZ Euler attitude,
+    // and body gyro. Its `acc` field changes convention with sensor mode, so
+    // never use it for velocity D. Filter derivatives of measured world velocity
+    // and body gyro instead, following PX4's derivative-on-measurement policy.
+    if (!derivative_initialized_) {
+      filtered_vel_ = vel_;
+      filtered_rate_ = w_body_;
+      previous_vel_ = vel_;
+      previous_rate_ = w_body_;
+      derivative_initialized_ = true;
+    } else {
+      const double alpha = 1.0 - std::exp(-2.0 * M_PI * derivative_cutoff_hz_ * dt);
+      filtered_vel_ += alpha * (vel_ - filtered_vel_);
+      filtered_rate_ += alpha * (w_body_ - filtered_rate_);
+      filtered_accel_ += alpha * ((vel_ - previous_vel_) / dt - filtered_accel_);
+      filtered_alpha_ += alpha * ((w_body_ - previous_rate_) / dt - filtered_alpha_);
+      previous_vel_ = vel_;
+      previous_rate_ = w_body_;
+    }
 
-    // R_WB from rpy
-    const double r = rpy_.x(), p = rpy_.y(), y = rpy_.z();
-    const double sr = std::sin(r), cr = std::cos(r);
-    const double sp = std::sin(p), cp = std::cos(p);
-    const double sy = std::sin(y), cy = std::cos(y);
+    // World-frame translation cascade. Both layers have separate XYZ P/I/D
+    // gains and integral states. Each stage clamps its output independently.
+    const Eigen::Vector3d vel_sp = layers_[0].update(
+      pos_ref - pos_, filtered_vel_, dt, velocity_limit_,
+      Eigen::Vector3d::Constant(pos_integral_limit_), !allocator_saturated_);
+    const Eigen::Vector3d acceleration_cmd = layers_[1].update(
+      vel_sp - vel_, filtered_accel_, dt, acceleration_limit_,
+      Eigen::Vector3d::Constant(vel_integral_limit_), !allocator_saturated_);
 
-    Eigen::Matrix3d R_WB;
-    R_WB <<  cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr,
-             sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr,
-               -sp,              cp*sr,              cp*cr;
-
-    const Eigen::Vector3d F_body = R_WB.transpose() * F_world;
+    // MuJoCo uses world +Z upward with gravity (0,0,-g). The required
+    // actuator force is m*(a_cmd - gravity_vector), then rotated into body.
+    const Eigen::Vector3d force_world = mass_ *
+      (acceleration_cmd + Eigen::Vector3d(0.0, 0.0, grav_));
+    const Eigen::Matrix3d r_wb = rotationWorldFromBody(rpy_);
+    const Eigen::Vector3d F_body = r_wb.transpose() * force_world;
 
     // The admittance topic carries an angular offset from its entry pose.
     // Publish the reference actually used by the attitude PID for debugging.
@@ -286,20 +424,27 @@ private:
     att_ref_msg.pitch_ref = static_cast<float>(att_ref.y() / deg_to_rad);
     att_ref_msg.yaw_ref = static_cast<float>(att_ref.z() / deg_to_rad);
     pub_att_ref_->publish(att_ref_msg);
-    const double r_ref_d = att_ref.x();
-    const double p_ref_d = att_ref.y();
-    const double y_ref_d = att_ref.z();
+    // Body-frame rotation cascade. The quaternion error is SO(3)-aware and
+    // never subtracts Euler angles. The fully actuated craft keeps force and
+    // torque independent; attitude does not derive from horizontal force.
+    const Eigen::Vector3d e_rotation = attitudeErrorBody(
+      rotationWorldFromBody(att_ref), r_wb);
+    const Eigen::Vector3d rate_sp = layers_[2].update(
+      e_rotation, filtered_rate_, dt, rate_limit_,
+      Eigen::Vector3d::Constant(att_integral_limit_), !allocator_saturated_);
+    const Eigen::Vector3d M_body = layers_[3].update(
+      rate_sp - w_body_, filtered_alpha_, dt, torque_limit_,
+      Eigen::Vector3d::Constant(rate_integral_limit_), !allocator_saturated_);
 
-    // yaw wrap-around
-    const double y_err = std::atan2(std::sin(y_ref_d - rpy_.z()),
-                                    std::cos(y_ref_d - rpy_.z()));
-    const double y_ref_equiv = rpy_.z() + y_err;
-
-    // attitude PID -> body moments
-    Eigen::Vector3d M_body;
-    M_body.x() = pid_att_[0](r_ref_d,     rpy_.x(), w_body_.x(), dt, reset_pid);
-    M_body.y() = pid_att_[1](p_ref_d,     rpy_.y(), w_body_.y(), dt, reset_pid);
-    M_body.z() = pid_att_[2](y_ref_equiv, rpy_.z(), w_body_.z(), dt, reset_pid);
+    publishLayerDebug(0, pos_ref, pos_);
+    publishLayerDebug(1, vel_sp, vel_);
+    publishLayerDebug(2, att_ref, rpy_);
+    publishLayerDebug(3, rate_sp, w_body_);
+    std_msgs::msg::Float64MultiArray wrench_debug;
+    for (const auto & v : {force_world, F_body, M_body}) {
+      for (int a = 0; a < 3; ++a) wrench_debug.data.push_back(v[a]);
+    }
+    pub_wrench_debug_->publish(wrench_debug);
 
     minitrone_interfaces::msg::Wrench w;
     w.moment[0] = static_cast<float>(M_body(0));
@@ -320,8 +465,13 @@ private:
   rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_att_cmd_;
   rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_admittance_att_cmd_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_admittance_active_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_reset_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_allocator_saturated_;
   rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr            pub_wrench_;
   rclcpp::Publisher<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr       pub_att_ref_;
+  std::array<rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr, 4> debug_pubs_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_wrench_debug_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr gain_callback_;
 
   rclcpp::Time last_time_;
 
@@ -335,13 +485,24 @@ private:
   Eigen::Vector3d att_cmd_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d admittance_att_cmd_{Eigen::Vector3d::Zero()};
 
-  std::function<double(double,double,double,double,bool)> pid_pos_[3];
-  std::function<double(double,double,double,double,bool)> pid_vel_[3];
-  std::function<double(double,double,double,double,bool)> pid_att_[3];
-  Eigen::Vector3d previous_velocity_{Eigen::Vector3d::Zero()};
-  bool have_previous_velocity_{false};
+  std::array<PidLayer, 4> layers_;
+  Eigen::Vector3d velocity_limit_{Eigen::Vector3d::Ones()};
+  Eigen::Vector3d acceleration_limit_{Eigen::Vector3d::Ones()};
+  Eigen::Vector3d rate_limit_{Eigen::Vector3d::Ones()};
+  Eigen::Vector3d torque_limit_{Eigen::Vector3d::Ones()};
+  double pos_integral_limit_{10.0}, vel_integral_limit_{10.0};
+  double att_integral_limit_{1.0}, rate_integral_limit_{1.0};
+  double derivative_cutoff_hz_{30.0};
+  Eigen::Vector3d filtered_vel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d filtered_accel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d filtered_rate_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d filtered_alpha_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d previous_vel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d previous_rate_{Eigen::Vector3d::Zero()};
+  bool derivative_initialized_{false};
+  bool allocator_saturated_{false};
 
-  double mass_{2.5};
+  double mass_{2.86};
   double grav_{9.81};
   bool have_state_{false}, have_cmd_{false}, have_att_cmd_{false};
   bool have_admittance_cmd_{false}, have_admittance_att_cmd_{false};

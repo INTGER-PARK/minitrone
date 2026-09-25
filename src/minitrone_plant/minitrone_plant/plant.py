@@ -83,6 +83,12 @@ class PlantRosNode(Node):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = 1.0 / PHYSICS_HZ
+        # Optional free-flight initial condition for headless hover validation.
+        # The default leaves the XML initial pose and all normal runs intact.
+        initial_base_z = float(self.declare_parameter("initial_base_z", -1.0).value)
+        if initial_base_z > 0.0:
+            if not math.isfinite(initial_base_z):
+                raise ValueError("initial_base_z must be finite")
         random_seed = int(self.declare_parameter("random_seed", 1, ParameterDescriptor(read_only=True)).value)
         self.rng = np.random.default_rng(random_seed)
         # Startup-only parameters cannot silently change the ROS value without
@@ -203,6 +209,10 @@ class PlantRosNode(Node):
         self.high_fidelity.configure_physics(
             self.model, self.data, self.base_body_id,
             [self.wall_geom_id, self.contact_plate_geom_id])
+        if initial_base_z > 0.0:
+            root_joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "root")
+            self.data.qpos[int(self.model.jnt_qposadr[root_joint]) + 2] = initial_base_z
+            mujoco.mj_forward(self.model, self.data)
         self.get_logger().info(self.high_fidelity.summary(random_seed))
         for geom_id in (self.wall_geom_id, self.contact_plate_geom_id):
             self.get_logger().info(
