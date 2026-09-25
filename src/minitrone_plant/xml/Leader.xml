@@ -1,4 +1,4 @@
-<mujoco model="minitrone_430_square_legs_servo_end_prop_wall_400x380_contact">
+<mujoco model="Leader">
   <!--
 
     Modified from minitrone_400x400x350_armature:
@@ -10,7 +10,7 @@
       - Propeller visual disks are preserved.
       - Servo angle saturation and BLDC saturation are kept matched to crosstrone_450x450x300.
       - Servo bodies are ordered as servo1, servo2, servo3, servo4 in the XML definition.
-      - A single +X perforated contact wall is kept.
+      - Identical contact plates are fixed symmetrically at x = +/-0.212 m.
 
     Target collision envelope: approximately 0.430 m x 0.430 m x 0.370 m.
 
@@ -20,7 +20,10 @@
       Pipe/propeller radii are preserved.
 
     Mass model:
-      - All physical mass is concentrated in the main body CoM.
+      - The original 2.5 kg main-body mass and inertia are preserved.
+      - Each fixed contact plate contributes 0.180 kg to the combined base inertial.
+      - Plate CoM inertia in body-aligned axes: Ixx=0.00298, Iyy=0.00234, Izz=0.00533 kg*m^2.
+      - Total physical mass is 2.86 kg (excluding tiny numerical placeholders).
       - Body frame origin is placed at the CoM, geometric center z = 0.185 m.
       - Inertial values are updated using a cuboid approximation for the 430 x 430 x 370 mm geometry.
       - Servo hinge rotational inertia is represented by joint armature only.
@@ -56,8 +59,14 @@
     <camera name="front_plate_view" pos="0.75 0.00 0.20" xyaxes="0 1 0 -0.20 0 0.98" />
     <body name="drone_base" pos="0.000000000 0.000000000 0.185000000">
       <freejoint name="root" />
-      <!-- All physical mass concentrated at the body-frame origin. -->
-      <inertial pos="0.000000000 0.000000000 0.000000000" mass="2.5" diaginertia="0.0670417 0.0670417 0.0770417" />
+      <!-- Combined rigid-body inertia: original 2.5 kg base plus two 0.180 kg plates.
+           Plate CoMs: (+/-0.212, 0, 0) m; combined CoM remains at the origin.
+           Ixx = 0.0670417 + 2*0.00298 = 0.0730017.
+           Iyy = 0.0670417 + 2*(0.00234 + 0.180*0.212^2) = 0.08790154.
+           Izz = 0.0770417 + 2*(0.00533 + 0.180*0.212^2) = 0.10388154.
+           Supplied plate values have Ixx+Iyy < Izz by 0.00001 kg*m^2;
+           they are used unchanged as contributions to this valid combined inertia. -->
+      <inertial pos="0.000000000 0.000000000 0.000000000" mass="2.86" diaginertia="0.0730017 0.08790154 0.10388154" />
       <site name="drone_imu" pos="0.000000000 0.000000000 0.000000000" quat="1 0 0 0" rgba="1 1 1 1" />
 
       <!-- Decorative visual-only central stack. Collision/dynamics remain governed by the existing geoms/inertial. -->
@@ -79,11 +88,14 @@
 
 
 
-      <!-- Single +X contact plate.
-           Collision envelope is a single solid plate on the Y-Z plane.
-           Dimensions: y = 0.400 m, z = 0.380 m, x thickness = 0.006 m. -->
+      <!-- Symmetric contact plates: each 0.400 x 0.380 x 0.006 m, mass 0.180 kg.
+           Plate masses and supplied CoM inertias are included in the base inertial above. -->
       <geom name="contact_plate_px" type="box"
             pos="0.212000000 0.000000000 0.000000000"
+            size="0.003000000 0.200000000 0.190000000"
+            material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
+      <geom name="contact_plate_nx" type="box"
+            pos="-0.212000000 0.000000000 0.000000000"
             size="0.003000000 0.200000000 0.190000000"
             material="mat_contact" contype="1" conaffinity="1" group="0" mass="0" />
       <!-- Four virtual load-cell locations at the contact-plate corners.

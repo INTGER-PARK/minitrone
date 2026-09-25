@@ -7,6 +7,8 @@ import numpy as np
 import rclpy
 from rclpy._rclpy_pybind11 import RCLError
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
+from minitrone_plant.high_fidelity import HighFidelityModel, PARAMETERS
 from ament_index_python.packages import get_package_share_directory
 
 import mujoco
@@ -16,8 +18,6 @@ from minitrone_interfaces.msg import CenterOfPressure, Input, MinitroneState, Mo
 from std_msgs.msg import Bool, Float64, Float64MultiArray, Int32
 
 PHYSICS_HZ = 400.0
-ZETA = 0.02          # thrust = ZETA * omega^2  (minitrone allocator/plant convention)
-DELAY_TIME = 0.01
 EXTERNAL_WRENCH_CMD_TIMEOUT = 0.2
 RAD2DEG = 180.0 / math.pi
 
@@ -83,8 +83,17 @@ class PlantRosNode(Node):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = 1.0 / PHYSICS_HZ
-        random_seed = int(self.declare_parameter("random_seed", 1).value)
+        random_seed = int(self.declare_parameter("random_seed", 1, ParameterDescriptor(read_only=True)).value)
         self.rng = np.random.default_rng(random_seed)
+        # Startup-only parameters cannot silently change the ROS value without
+        # rebuilding fixed uncertainty and queue state. Restart after editing.
+        hf_config = {
+            name: self.declare_parameter(
+                name, spec[0], ParameterDescriptor(
+                    read_only=True, description=f"{spec[2]} [{spec[1]}]; provisional")).value
+            for name, spec in PARAMETERS.items()
+        }
+        self.high_fidelity = HighFidelityModel(hf_config, random_seed, 1.0 / PHYSICS_HZ)
 
         def aid(name: str) -> int:
             idx = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name.encode())
@@ -189,6 +198,39 @@ class PlantRosNode(Node):
         if solver_iterations > 0:
             self.model.opt.iterations = solver_iterations
         self._configure_contact_test_case()
+        # Case A/B/C/D establishes the nominal pair first. The uncertainty layer
+        # preserves those masks/condim and only changes friction and solref.
+        self.high_fidelity.configure_physics(
+            self.model, self.data, self.base_body_id,
+            [self.wall_geom_id, self.contact_plate_geom_id])
+        self.get_logger().info(self.high_fidelity.summary(random_seed))
+        for geom_id in (self.wall_geom_id, self.contact_plate_geom_id):
+            self.get_logger().info(
+                f"[high_fidelity] actual contact geom={geom_id} "
+                f"friction={self.model.geom_friction[geom_id].tolist()} "
+                f"solref={self.model.geom_solref[geom_id].tolist()}")
+        self.get_logger().info(
+            f"[high_fidelity] plant base mass={self.model.body_mass[self.base_body_id]} kg; "
+            f"principal J={self.model.body_inertia[self.base_body_id].tolist()} kg*m^2; "
+            f"ipos={self.model.body_ipos[self.base_body_id].tolist()} m; controller nominal unchanged")
+        # Keep the XML as an independent hard safety limit, even with HF off.
+        # This also prevents overflow from malformed, excessively large omega.
+        self.prop_thrust_limits = np.array([
+            self.model.actuator_ctrlrange[i, 1] for i in self.aid_prop])
+        if (not np.all(self.model.actuator_ctrllimited[self.aid_prop])
+                or not np.isfinite(self.prop_thrust_limits).all()
+                or np.any(self.prop_thrust_limits <= 0)):
+            raise ValueError("BLDC actuators require finite positive XML ctrl limits")
+        for index, actuator_id in enumerate(self.aid_prop):
+            if self.model.actuator_forcelimited[actuator_id]:
+                self.prop_thrust_limits[index] = min(
+                    self.prop_thrust_limits[index],
+                    self.model.actuator_forcerange[actuator_id, 1])
+        if np.any(self.prop_thrust_limits <= 0):
+            raise ValueError("BLDC force limits must be positive")
+        self.get_logger().info(
+            f"[high_fidelity] XML motor limits={self.prop_thrust_limits.tolist()} N; "
+            f"configured plant limit={hf_config['motor_thrust_max']} N")
         self.prop_site_id = [
             siteid("prop1_site"),
             siteid("prop2_site"),
@@ -225,11 +267,10 @@ class PlantRosNode(Node):
 
         # -------- Input buffers --------
         self.ctrl_recv = np.zeros(8, dtype=float)
-        self._delay_len = max(1, int(DELAY_TIME * PHYSICS_HZ))
-        self._delay_buf = np.zeros((self._delay_len, 8), dtype=float)
-        self._delay_idx = 0
 
         # -------- State memory --------
+        self.prev_true_vel = None
+        self.prev_true_gyro = None
         self.prev_pub_t: Optional[float] = None
         self.prev_linvel_W: Optional[np.ndarray] = None
         self.prev_gyro_I: Optional[np.ndarray] = None
@@ -364,6 +405,15 @@ class PlantRosNode(Node):
                     self.wall_geom_id, self.contact_plate_geom_id):
                     self.model.geom_contype[geom_id] = 2
                     self.model.geom_conaffinity[geom_id] = 2
+                # Compiled body collision masks are OR-reductions of geom masks.
+                # Updating only geom bits leaves stale broad-phase masks and can
+                # suppress the intended plate/palm pair entirely in A/B/C.
+                for body_id in (self.base_body_id, self.wall_body_id):
+                    geom_ids = np.flatnonzero(self.model.geom_bodyid == body_id)
+                    self.model.body_contype[body_id] = np.bitwise_or.reduce(
+                        self.model.geom_contype[geom_ids], initial=0)
+                    self.model.body_conaffinity[body_id] = np.bitwise_or.reduce(
+                        self.model.geom_conaffinity[geom_ids], initial=0)
 
         if self.contact_solref_timeconst > 0.0:
             minimum_timeconst = 2.0 * float(self.model.opt.timestep)
@@ -459,12 +509,10 @@ class PlantRosNode(Node):
         for actuator_id, ctrl in zip(self.aid_palm, palm_ctrl):
             self.data.ctrl[actuator_id] = float(ctrl)
 
-    def _delay_step(self) -> np.ndarray:
-        self._delay_buf[self._delay_idx] = self.ctrl_recv
-        self._delay_idx = (self._delay_idx + 1) % self._delay_len
-        return self._delay_buf[self._delay_idx]
-
     def _actuation_wrench_body(self):
+        # Preserve the observer API: motor wrench about the nominal BODY origin.
+        # Actual CoM uncertainty belongs to unknown model mismatch; do not move
+        # the controller's reference point to the sampled plant CoM implicitly.
         base_pos_W = np.asarray(self.data.xpos[self.base_body_id], dtype=float)
         R_WB = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
         force_W = np.zeros(3, dtype=float)
@@ -497,8 +545,12 @@ class PlantRosNode(Node):
 
         R_WB = np.asarray(self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
         self.data.xfrc_applied[self.base_body_id, :] = 0.0
-        self.data.xfrc_applied[self.base_body_id, 0:3] = R_WB @ self.external_force_body
-        self.data.xfrc_applied[self.base_body_id, 3:6] = R_WB @ self.external_moment_body
+        # xfrc_applied is WORLD force/torque at the actual body CoM. The two
+        # BODY-axis external sources remain separate from actuator_force, so
+        # the observer cannot accidentally cancel the unknown colored residual.
+        residual = self.high_fidelity.external_residual()
+        self.data.xfrc_applied[self.base_body_id, 0:3] = R_WB @ (self.external_force_body + residual[:3])
+        self.data.xfrc_applied[self.base_body_id, 3:6] = R_WB @ (self.external_moment_body + residual[3:])
 
     def _measured_corner_loads(self) -> np.ndarray:
         """Distribute MuJoCo contact normal loads to four plate-corner load cells."""
@@ -601,6 +653,7 @@ class PlantRosNode(Node):
         """
         base_pos_world = np.asarray(
             self.data.xpos[self.base_body_id], dtype=float)
+        com_pos_world = np.asarray(self.data.xipos[self.base_body_id], dtype=float)
         rotation_world_body = np.asarray(
             self.data.xmat[self.base_body_id], dtype=float).reshape(3, 3)
         force_world = np.zeros(3, dtype=float)
@@ -657,7 +710,7 @@ class PlantRosNode(Node):
                 force_normal_plate_world + force_tangential_plate_world)
             torque_on_plate_world = sign_for_plate * torque_on_geom2_world
             contact_pos_world = np.asarray(contact.pos, dtype=float)
-            lever_world = contact_pos_world - base_pos_world
+            lever_world = contact_pos_world - com_pos_world
 
             force_world += force_on_plate_world
             moment_normal_world += np.cross(
@@ -689,7 +742,7 @@ class PlantRosNode(Node):
         self.pub_contact_wrench_gt.publish(wrench_msg)
         moment_center_body = (
             moment_com_body
-            - np.cross(self.contact_center_body, force_body))
+            - np.cross(self.contact_center_body - self.model.body_ipos[self.base_body_id], force_body))
         center_wrench_msg = Wrench()
         center_wrench_msg.force = force_body.astype(np.float32).tolist()
         center_wrench_msg.moment = (
@@ -793,97 +846,128 @@ class PlantRosNode(Node):
             if rclpy.ok() and not self._stop:
                 raise
 
+    def _physics_step(self):
+        """Advance every model exactly once per 2.5 ms of simulation time."""
+        thrust, angles = self.high_fidelity.actuate(
+            float(self.data.time), self.ctrl_recv, self.prop_thrust_limits)
+        self.data.ctrl[self.aid_prop] = thrust
+        self.data.ctrl[self.aid_servo] = angles
+        self._apply_palm_pose_cmd()
+        self._apply_external_wrench()
+        mujoco.mj_step(self.model, self.data)
+        # mj_step integrates qpos after computing sensors; refresh to pair the
+        # published state, contact geometry and actuator wrench at the same pose.
+        mujoco.mj_forward(self.model, self.data)
+        invalid_warnings = (mujoco.mjtWarning.mjWARN_BADQPOS,
+                            mujoco.mjtWarning.mjWARN_BADQVEL,
+                            mujoco.mjtWarning.mjWARN_BADQACC)
+        # MuJoCo can auto-reset after a numerical failure, leaving finite arrays.
+        # Inspect warning counters as well so that a reset cannot look successful.
+        if (not np.isfinite(self.data.qpos).all()
+                or not np.isfinite(self.data.qvel).all()
+                or not np.isfinite(self.data.qacc).all()
+                or any(self.data.warning[int(w)].number for w in invalid_warnings)):
+            raise RuntimeError("invalid MuJoCo state or numerical-reset warning")
+
+    def _measure_state(self):
+        quat_W = self._sensing(self.sid_quat)
+        true_gyro = self._sensing(self.sid_gyro)
+        true_pos = self._sensing(self.sid_pos)
+        true_vel = self._sensing(self.sid_vel)
+        if self.high_fidelity.enabled('inertial_uncertainty'):
+            # XML framepos/framelinvel on BODY refer to the inertial CoM. Once
+            # ipos moves, keep the sensor at the original body-frame location
+            # rather than making the simulated tracker follow randomized CoM.
+            true_pos = np.array(self.data.xpos[self.base_body_id], copy=True)
+            velocity = np.zeros(6)
+            mujoco.mj_objectVelocity(
+                self.model, self.data, mujoco.mjtObj.mjOBJ_XBODY,
+                self.base_body_id, velocity, 0)
+            true_vel = velocity[3:]
+        true_servo = np.array([self._sensing(sid)[0] for sid in self.sid_servo_ang])
+        t = float(self.data.time)
+        dt = 1.0 / PHYSICS_HZ
+        if self.high_fidelity.enabled('sensor_model'):
+            # Differentiate truth at the fixed physics period BEFORE sampling.
+            # Differentiating noisy/held 100 Hz velocity at 400 Hz creates fake
+            # acceleration spikes. acc is body IMU specific force per the msg.
+            acc_W = np.zeros(3) if self.prev_true_vel is None else (true_vel - self.prev_true_vel) / dt
+            alpha = np.zeros(3) if self.prev_true_gyro is None else (true_gyro - self.prev_true_gyro) / dt
+            rotation = np.asarray(self.data.xmat[self.base_body_id]).reshape(3, 3)
+            truth = dict(position=true_pos, velocity=true_vel,
+                         attitude=quat_to_rpy(quat_W), gyro=true_gyro,
+                         servo=true_servo,
+                         acceleration=rotation.T @ (acc_W - self.model.opt.gravity),
+                         angular_acceleration=alpha)
+            sensed = self.high_fidelity.measure(t, truth)
+            pos_W, vel_W = sensed['position'], sensed['velocity']
+            rpy, gyro_I = sensed['attitude'], sensed['gyro']
+            servo = sensed['servo']
+            acc_W, a_rpy = sensed['acceleration'], sensed['angular_acceleration']
+        else:
+            # Retain legacy white-noise channels and legacy world acceleration
+            # convention on OFF; the HF sensor path fixes the IMU convention.
+            gyro_I = self._noisy(true_gyro, SIG_GYRO)
+            pos_W = self._noisy(true_pos, SIG_POS)
+            vel_W = self._noisy(true_vel, SIG_VEL)
+            rpy = quat_to_rpy(quat_W)
+            servo = self._noisy(true_servo, SIG_SERVO)
+            acc_W = np.zeros(3) if self.prev_pub_t is None else (vel_W - self.prev_linvel_W) / dt
+            a_rpy = np.zeros(3) if self.prev_pub_t is None else (gyro_I - self.prev_gyro_I) / dt
+        self.prev_pub_t = t
+        self.prev_linvel_W = vel_W.copy()
+        self.prev_gyro_I = gyro_I.copy()
+        self.prev_true_vel = true_vel.copy()
+        self.prev_true_gyro = true_gyro.copy()
+        return pos_W, vel_W, acc_W, rpy, gyro_I, a_rpy, servo
+
+    def _publish_state(self):
+        pos_W, vel_W, acc_W, rpy, gyro_I, a_rpy, servo = self._measure_state()
+        msg = MinitroneState()
+        msg.pos   = pos_W.tolist()
+        msg.vel   = vel_W.tolist()
+        msg.acc   = acc_W.tolist()
+        msg.rpy   = rpy.tolist()
+        msg.w_rpy = gyro_I.tolist()
+        msg.a_rpy = a_rpy.tolist()
+        msg.servo = (servo * RAD2DEG).tolist()
+
+        self.pub_state.publish(msg)
+
+        actuation_force_B, actuation_moment_B = self._actuation_wrench_body()
+        mob_msg = MobObserverInput()
+        mob_msg.step = int(round(float(self.data.time) * PHYSICS_HZ))
+        mob_msg.sim_time = float(self.data.time)
+        mob_msg.pos = pos_W.tolist()
+        mob_msg.vel = vel_W.tolist()
+        mob_msg.rpy = rpy.tolist()
+        mob_msg.w_rpy = gyro_I.tolist()
+        mob_msg.actuation_force = actuation_force_B.astype(np.float32).tolist()
+        mob_msg.actuation_moment = actuation_moment_B.astype(np.float32).tolist()
+        self.pub_mob_observer_input.publish(mob_msg)
+
+        actuation_wrench_msg = Wrench()
+        actuation_wrench_msg.force = actuation_force_B.astype(np.float32).tolist()
+        actuation_wrench_msg.moment = actuation_moment_B.astype(np.float32).tolist()
+        self.pub_actuation_wrench_body.publish(actuation_wrench_msg)
+        self._publish_cop_real()
+        self._plate_wall_contact_debug()
+        self._publish_palm_pose()
+
     def _sim_loop_impl(self):
         next_step = time.perf_counter()
-        next_pub = next_step
-
         while rclpy.ok() and not self._stop:
             now = time.perf_counter()
-
-            with self._lock:
-                u = self._delay_step()  # [omega1..4, servo1..4]
-
-                # ---- props: ctrl = ZETA * omega^2 ----
-                for i in range(4):
-                    omega = float(u[i])
-                    if omega < 0.0:
-                        omega = 0.0
-                    self.data.ctrl[self.aid_prop[i]] = ZETA * (omega * omega)
-
-                # ---- servos: ctrl = desired angle (rad) ----
-                for i in range(4):
-                    self.data.ctrl[self.aid_servo[i]] = float(u[4 + i])
-
-                self._apply_palm_pose_cmd()
-                self._apply_external_wrench()
-
-                # ---- step physics ----
-                while now >= next_step:
-                    mujoco.mj_step(self.model, self.data)
-                    next_step += 1.0 / PHYSICS_HZ
-
-                # ---- publish state ----
-                while now >= next_pub:
-                    quat_W = self._sensing(self.sid_quat)
-                    gyro_I = self._noisy(self._sensing(self.sid_gyro), SIG_GYRO)
-                    pos_W  = self._noisy(self._sensing(self.sid_pos),  SIG_POS)
-                    vel_W  = self._noisy(self._sensing(self.sid_vel),  SIG_VEL)
-
-                    rpy = quat_to_rpy(quat_W)
-
-                    servo = self._noisy(
-                        np.array([self._sensing(sid)[0] for sid in self.sid_servo_ang], dtype=float),
-                        SIG_SERVO
-                    )
-
-                    t = now
-                    if self.prev_pub_t is None:
-                        acc_W = np.zeros(3, dtype=float)
-                        a_rpy = np.zeros(3, dtype=float)
-                    else:
-                        dt = max(1e-6, t - self.prev_pub_t)
-                        acc_W = (vel_W - self.prev_linvel_W) / dt
-                        a_rpy = (gyro_I - self.prev_gyro_I) / dt
-
-                    self.prev_pub_t = t
-                    self.prev_linvel_W = vel_W.copy()
-                    self.prev_gyro_I = gyro_I.copy()
-
-                    msg = MinitroneState()
-                    msg.pos   = pos_W.tolist()
-                    msg.vel   = vel_W.tolist()
-                    msg.acc   = acc_W.tolist()
-                    msg.rpy   = rpy.tolist()
-                    msg.w_rpy = gyro_I.tolist()
-                    msg.a_rpy = a_rpy.tolist()
-                    msg.servo = (servo * RAD2DEG).tolist()
-
-                    self.pub_state.publish(msg)
-
-                    actuation_force_B, actuation_moment_B = self._actuation_wrench_body()
-                    mob_msg = MobObserverInput()
-                    mob_msg.step = int(round(float(self.data.time) * PHYSICS_HZ))
-                    mob_msg.sim_time = float(self.data.time)
-                    mob_msg.pos = pos_W.tolist()
-                    mob_msg.vel = vel_W.tolist()
-                    mob_msg.rpy = rpy.tolist()
-                    mob_msg.w_rpy = gyro_I.tolist()
-                    mob_msg.actuation_force = actuation_force_B.astype(np.float32).tolist()
-                    mob_msg.actuation_moment = actuation_moment_B.astype(np.float32).tolist()
-                    self.pub_mob_observer_input.publish(mob_msg)
-
-                    actuation_wrench_msg = Wrench()
-                    actuation_wrench_msg.force = actuation_force_B.astype(np.float32).tolist()
-                    actuation_wrench_msg.moment = actuation_moment_B.astype(np.float32).tolist()
-                    self.pub_actuation_wrench_body.publish(actuation_wrench_msg)
-                    self._publish_cop_real()
-                    self._plate_wall_contact_debug()
-                    self._publish_palm_pose()
-                    next_pub += 1.0 / PHYSICS_HZ
-
+            # Wall time only paces execution. Queues, noise and actuator states
+            # advance on simulation ticks, including every catch-up step.
+            while now >= next_step and rclpy.ok() and not self._stop:
+                with self._lock:
+                    self._physics_step()
+                    self._publish_state()
+                next_step += 1.0 / PHYSICS_HZ
             sleep_t = next_step - time.perf_counter()
             if sleep_t > 0:
-                time.sleep(sleep_t)
+                time.sleep(sleep_t)  # Existing real-time pacing, not sensor latency.
 
     def _viewer_key_callback(self, keycode):
         """Toggle plate contact-force arrows when F is pressed."""

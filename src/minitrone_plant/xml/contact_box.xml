@@ -1,0 +1,41 @@
+<mujoco model="contact_box">
+  <asset>
+    <material name="contact_box_plastic" rgba="0.76 0.82 0.78 1"
+              specular="0.15" shininess="0.20"/>
+    <material name="contact_box_stand_metal" rgba="0.24 0.29 0.34 1"
+              specular="0.20" shininess="0.30"/>
+  </asset>
+
+  <worldbody>
+    <!-- Fixed pedestal: the 0.90 m post supports the box by contact only.
+         Both +/-X box faces remain accessible for a future two-drone grasp. -->
+    <body name="contact_box_stand" pos="0.85 0 0">
+      <geom name="contact_box_stand_base" type="cylinder"
+            pos="0 0 0.02" size="0.14 0.02"
+            material="contact_box_stand_metal" contype="1" conaffinity="3"/>
+      <geom name="contact_box_stand_post" type="box"
+            pos="0 0 0.47" size="0.04 0.04 0.43"
+            material="contact_box_stand_metal" contype="1" conaffinity="3"
+            condim="3" friction="0.6 0 0" solref="0.01 1"/>
+    </body>
+
+    <!-- Outer dimensions (X,Y,Z): 0.30 x 0.40 x 0.30 m; total mass: 0.50 kg.
+         Inertia approximates a closed, uniform 1 mm hollow shell, normalized
+         to 0.50 kg. For each axis, subtract inner-box inertia from outer-box
+         inertia at common density: I = m*(Vo*So - Vi*Si)/(12*(Vo-Vi)),
+         where S is the sum of the other two squared side lengths.
+         Collision uses the closed outer envelope; there is no attachment
+         to the pedestal, actuator, or equality constraint. -->
+    <body name="contact_box" pos="0.85 0 1.05">
+      <freejoint name="contact_box_free"/>
+      <inertial pos="0 0 0" mass="0.5"
+                diaginertia="0.01668440 0.01286978 0.01668440"/>
+      <!-- Accept ordinary geoms (bit 1) and the isolated drone plate (bit 2).
+           Sliding friction enables a compression grasp without adhesion. -->
+      <geom name="contact_box_collision" type="box" size="0.15 0.20 0.15"
+            material="contact_box_plastic" contype="1" conaffinity="3"
+            condim="3" friction="0.8 0 0" solref="0.01 1"
+            solimp="0.95 0.99 0.001" margin="0"/>
+    </body>
+  </worldbody>
+</mujoco>

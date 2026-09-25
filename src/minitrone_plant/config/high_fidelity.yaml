@@ -1,0 +1,119 @@
+# PROVISIONAL / NOMINAL values, not hardware identification results.
+# Restart the plant after editing; parameters are startup-only.
+# The node defaults to HF OFF; loading this example turns HF ON.
+minitrone_plant:
+  ros__parameters:
+    random_seed: 1
+    enable_high_fidelity: true #switch to enable high fidelity simulation
+    enable_motor_dynamics: true
+    enable_servo_dynamics: true
+    enable_motor_mismatch: true
+    enable_thrust_saturation: true
+    enable_sensor_model: true
+    enable_inertial_uncertainty: true
+    enable_contact_uncertainty: true
+    enable_residual_wrench: true
+    legacy_input_delay: 0.0075
+    motor_command_delay: 0.01
+    motor_time_constant_up: 0.022
+    motor_time_constant_down: 0.025
+    motor_thrust_coefficient: 0.02
+    motor_gains:
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    motor_gain_random_range: 0.03
+    motor_thrust_max: 15.0
+    servo_time_constant: 0.04
+    servo_command_delay: 0.005
+    servo_rate_limit: 5.0
+    servo_angle_min: -1.1344640137963142
+    servo_angle_max: 1.1344640137963142
+    inertia_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+    inertia_random_range: 0.05
+    com_offset:
+    - 0.0
+    - 0.0
+    - 0.0
+    com_random_range: 0.003
+    contact_friction_scale: 1.0
+    contact_time_constant_scale: 1.0
+    contact_damping_scale: 1.0
+    contact_random_range: 0.05
+    residual_time_constant: 0.2
+    residual_force_std:
+    - 0.05
+    - 0.05
+    - 0.05
+    residual_moment_std:
+    - 0.002
+    - 0.002
+    - 0.002
+    sensor_position_update_rate_hz: 100.0
+    sensor_position_latency_sec: 0.01
+    sensor_position_noise_std: 0.001
+    sensor_position_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_position_initial_bias_std: 0.001
+    sensor_position_bias_random_walk_std: 0.0001
+    sensor_velocity_update_rate_hz: 100.0
+    sensor_velocity_latency_sec: 0.01
+    sensor_velocity_noise_std: 0.001
+    sensor_velocity_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_velocity_initial_bias_std: 0.001
+    sensor_velocity_bias_random_walk_std: 0.0001
+    sensor_attitude_update_rate_hz: 400.0
+    sensor_attitude_latency_sec: 0.0025
+    sensor_attitude_noise_std: 0.001
+    sensor_attitude_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_attitude_initial_bias_std: 0.0005
+    sensor_attitude_bias_random_walk_std: 1.0e-05
+    sensor_gyro_update_rate_hz: 400.0
+    sensor_gyro_latency_sec: 0.0025
+    sensor_gyro_noise_std: 0.001
+    sensor_gyro_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_gyro_initial_bias_std: 0.001
+    sensor_gyro_bias_random_walk_std: 0.0001
+    sensor_acceleration_update_rate_hz: 400.0
+    sensor_acceleration_latency_sec: 0.0025
+    sensor_acceleration_noise_std: 0.02
+    sensor_acceleration_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_acceleration_initial_bias_std: 0.01
+    sensor_acceleration_bias_random_walk_std: 0.001
+    sensor_angular_acceleration_update_rate_hz: 400.0
+    sensor_angular_acceleration_latency_sec: 0.0025
+    sensor_angular_acceleration_noise_std: 0.01
+    sensor_angular_acceleration_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_angular_acceleration_initial_bias_std: 0.001
+    sensor_angular_acceleration_bias_random_walk_std: 0.0001
+    sensor_servo_update_rate_hz: 50.0
+    sensor_servo_latency_sec: 0.005
+    sensor_servo_noise_std: 0.0001
+    sensor_servo_bias:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    sensor_servo_initial_bias_std: 0.0001
+    sensor_servo_bias_random_walk_std: 1.0e-05

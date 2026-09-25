@@ -4,7 +4,7 @@
   <name>minitrone_interfaces</name>
   <version>0.0.0</version>
   <description>Minitrone ROS 2 message interfaces</description>
-  <maintainer email="ryung9514@naver.com">ryung</maintainer>
+  <maintainer email="jjungsoo2022@gmail.com">ryung</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

@@ -1,8 +1,9 @@
 from launch import LaunchDescription
 from launch.actions import ExecuteProcess, RegisterEventHandler
 from launch.event_handlers import OnProcessStart
-from launch.substitutions import FindExecutable
+from launch.substitutions import FindExecutable, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,9 @@ def generate_launch_description():
         package="minitrone_plant",
         executable="minitrone_plant",
         name="minitrone_plant",
+        parameters=[PathJoinSubstitution([
+            FindPackageShare("minitrone_plant"), "config", "high_fidelity.yaml"
+        ])],
         output="screen"
     )
 

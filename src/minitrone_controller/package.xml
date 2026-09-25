@@ -4,7 +4,7 @@
   <version>0.0.1</version>
   <description>Minitrone controller nodes</description>
 
-  <maintainer email="ryung9514@naver.com">ryung</maintainer>
+  <maintainer email="jjungsoo2022@gmail.com">ryung</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

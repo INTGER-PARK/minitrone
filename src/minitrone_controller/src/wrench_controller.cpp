@@ -10,6 +10,8 @@
 #include <cmath>
 #include <functional>
 #include <string>
+#include <limits>
+#include <stdexcept>
 
 class WrenchController : public rclcpp::Node
 {
@@ -25,7 +27,11 @@ public:
     mass_ = this->get_parameter("mass").as_double();
     grav_ = this->get_parameter("gravity").as_double();
 
-    // ===================== gains (기존 유지) =====================
+    if (!std::isfinite(mass_) || mass_ <= 0.0 || !std::isfinite(grav_)) {
+      throw std::invalid_argument("mass must be positive and gravity must be finite");
+    }
+
+    // Legacy force gains define the equivalent default cascade tuning.
     const double KP_POS[3] = {28.0, 28.0, 24.0};
     const double KI_POS[3] = {1.5, 1.5, 1.2};
     const double KD_POS[3] = {6.0, 6.0, 10.0};
@@ -61,9 +67,34 @@ public:
       };
     };
 
-    pid_pos_[0] = init_pid(KP_POS[0], KI_POS[0], KD_POS[0], I_MIN_POS, I_MAX_POS, OUT_MIN_POS, OUT_MAX_POS);
-    pid_pos_[1] = init_pid(KP_POS[1], KI_POS[1], KD_POS[1], I_MIN_POS, I_MAX_POS, OUT_MIN_POS, OUT_MAX_POS);
-    pid_pos_[2] = init_pid(KP_POS[2], KI_POS[2], KD_POS[2], I_MIN_POS, I_MAX_POS, OUT_MIN_POS, OUT_MAX_POS);
+    const char * axes[] = {"x", "y", "z"};
+    auto gain = [this](const std::string & name, double value) {
+      const double result = declare_parameter<double>(name, value);
+      if (!std::isfinite(result) || result < 0.0) {
+        throw std::invalid_argument(name + " must be finite and nonnegative");
+      }
+      return result;
+    };
+    for (int axis = 0; axis < 3; ++axis) {
+      const std::string suffix = std::string("_") + axes[axis];
+      // v_ref = (Kp_old / Kd_old) e + integral(Ki_old / Kd_old e).
+      // a_ref = (Kd_old / mass) (v_ref - v_world).
+      // Thus mass * a_ref reproduces the old force PID with default gains.
+      const double pos_kp = gain("position_kp" + suffix, KP_POS[axis] / KD_POS[axis]);
+      const double pos_ki = gain("position_ki" + suffix, KI_POS[axis] / KD_POS[axis]);
+      const double pos_kd = gain("position_kd" + suffix, 0.0);
+      const double vel_kp = gain("velocity_kp" + suffix, KD_POS[axis] / mass_);
+      const double vel_ki = gain("velocity_ki" + suffix, 0.0);
+      const double vel_kd = gain("velocity_kd" + suffix, 0.0);
+      // Zero disables the optional speed limit to retain the legacy force law.
+      const double speed_limit = gain("velocity_limit" + suffix, 0.0);
+      const double vmax = speed_limit > 0.0 ? speed_limit :
+        std::numeric_limits<double>::infinity();
+      pid_pos_[axis] = init_pid(pos_kp, pos_ki, pos_kd,
+        I_MIN_POS / KD_POS[axis], I_MAX_POS / KD_POS[axis], -vmax, vmax);
+      pid_vel_[axis] = init_pid(vel_kp, vel_ki, vel_kd,
+        I_MIN_POS / mass_, I_MAX_POS / mass_, OUT_MIN_POS / mass_, OUT_MAX_POS / mass_);
+    }
 
     pid_att_[0] = init_pid(KP_ATT[0], KI_ATT[0], KD_ATT[0], I_MIN_ATT, I_MAX_ATT, OUT_MIN_ATT, OUT_MAX_ATT);
     pid_att_[1] = init_pid(KP_ATT[1], KI_ATT[1], KD_ATT[1], I_MIN_ATT, I_MAX_ATT, OUT_MIN_ATT, OUT_MAX_ATT);
@@ -106,6 +137,8 @@ public:
     // The passive-aligning filter consumes the conventional controller output.
     pub_wrench_ = this->create_publisher<minitrone_interfaces::msg::Wrench>(
       "/minitrone/wrench_cmd", 10);
+    pub_att_ref_ = this->create_publisher<minitrone_interfaces::msg::AttitudeCmd>(
+      "/minitrone/att_ref", 10);
 
     pos_cmd_.setZero();
     att_cmd_.setZero();
@@ -196,7 +229,8 @@ private:
     const rclcpp::Time now = this->now();
     double dt = (now - last_time_).seconds();
     last_time_ = now;
-    if (!(dt > 0.0) || dt > 0.2) dt = 1.0 / 400.0;
+    const bool valid_dt = dt > 0.0 && dt <= 0.2;
+    if (!valid_dt) dt = 1.0 / 400.0;
 
     const bool use_admittance =
       admittance_active_ && have_admittance_cmd_ && have_admittance_att_cmd_;
@@ -207,15 +241,27 @@ private:
     const bool reset_pid = reset_pid_pending_;
     reset_pid_pending_ = false;
 
-    Eigen::Vector3d position_pid;
-    position_pid.x() = pid_pos_[0](pos_ref.x(), pos_.x(), vel_.x(), dt, reset_pid);
-    position_pid.y() = pid_pos_[1](pos_ref.y(), pos_.y(), vel_.y(), dt, reset_pid);
-    position_pid.z() = pid_pos_[2](pos_ref.z(), pos_.z(), vel_.z(), dt, reset_pid);
+    // Position and velocity are world-frame quantities. Differentiate measured
+    // world velocity for the optional inner D term: state.acc is body-frame IMU
+    // specific force, not world-frame kinematic acceleration. Reset derivative
+    // history on mode changes, first sample, or a timing discontinuity.
+    const Eigen::Vector3d acceleration_world =
+      have_previous_velocity_ && valid_dt && !reset_pid ?
+      Eigen::Vector3d((vel_ - previous_velocity_) / dt) : Eigen::Vector3d::Zero();
+    previous_velocity_ = vel_;
+    have_previous_velocity_ = true;
 
-    Eigen::Vector3d F_world;
-    F_world.x() = position_pid.x();
-    F_world.y() = position_pid.y();
-    F_world.z() = position_pid.z() + mass_ * grav_;
+    Eigen::Vector3d velocity_ref_world;
+    Eigen::Vector3d acceleration_ref_world;
+    for (int axis = 0; axis < 3; ++axis) {
+      velocity_ref_world[axis] = pid_pos_[axis](
+        pos_ref[axis], pos_[axis], vel_[axis], dt, reset_pid);
+      acceleration_ref_world[axis] = pid_vel_[axis](
+        velocity_ref_world[axis], vel_[axis], acceleration_world[axis], dt, reset_pid);
+    }
+
+    Eigen::Vector3d F_world = mass_ * acceleration_ref_world;
+    F_world.z() += mass_ * grav_;
 
     // R_WB from rpy
     const double r = rpy_.x(), p = rpy_.y(), y = rpy_.z();
@@ -230,10 +276,16 @@ private:
 
     const Eigen::Vector3d F_body = R_WB.transpose() * F_world;
 
-    Eigen::Vector3d att_ref =
-      use_admittance ?
-      admittance_att_cmd_ :
-      (have_att_cmd_ ? att_cmd_ : Eigen::Vector3d::Zero());
+    // The admittance topic carries an angular offset from its entry pose.
+    // Publish the reference actually used by the attitude PID for debugging.
+    const Eigen::Vector3d att_ref =
+      (have_att_cmd_ ? att_cmd_ : Eigen::Vector3d::Zero()) +
+      (use_admittance ? admittance_att_cmd_ : Eigen::Vector3d::Zero());
+    minitrone_interfaces::msg::AttitudeCmd att_ref_msg;
+    att_ref_msg.roll_ref = static_cast<float>(att_ref.x() / deg_to_rad);
+    att_ref_msg.pitch_ref = static_cast<float>(att_ref.y() / deg_to_rad);
+    att_ref_msg.yaw_ref = static_cast<float>(att_ref.z() / deg_to_rad);
+    pub_att_ref_->publish(att_ref_msg);
     const double r_ref_d = att_ref.x();
     const double p_ref_d = att_ref.y();
     const double y_ref_d = att_ref.z();
@@ -269,6 +321,7 @@ private:
   rclcpp::Subscription<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr     sub_admittance_att_cmd_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                        sub_admittance_active_;
   rclcpp::Publisher<minitrone_interfaces::msg::Wrench>::SharedPtr            pub_wrench_;
+  rclcpp::Publisher<minitrone_interfaces::msg::AttitudeCmd>::SharedPtr       pub_att_ref_;
 
   rclcpp::Time last_time_;
 
@@ -283,7 +336,10 @@ private:
   Eigen::Vector3d admittance_att_cmd_{Eigen::Vector3d::Zero()};
 
   std::function<double(double,double,double,double,bool)> pid_pos_[3];
+  std::function<double(double,double,double,double,bool)> pid_vel_[3];
   std::function<double(double,double,double,double,bool)> pid_att_[3];
+  Eigen::Vector3d previous_velocity_{Eigen::Vector3d::Zero()};
+  bool have_previous_velocity_{false};
 
   double mass_{2.5};
   double grav_{9.81};

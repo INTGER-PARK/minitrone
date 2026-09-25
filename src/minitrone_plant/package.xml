@@ -4,10 +4,12 @@
   <name>minitrone_plant</name>
   <version>0.0.0</version>
   <description>Minitrone MuJoCo plant loader</description>
-  <maintainer email="ryung9514@naver.com">ryung</maintainer>
+  <maintainer email="jjungsoo2022@gmail.com">ryung</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
+  <exec_depend>python3-numpy</exec_depend>
   <depend>std_msgs</depend>
 
   <exec_depend>ament_index_python</exec_depend>

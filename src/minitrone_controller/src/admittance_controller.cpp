@@ -34,6 +34,50 @@ constexpr std::size_t kDof = 6;
 const std::array<std::string, kDof> kAxisNames = {
   "x", "y", "z", "roll", "pitch", "yaw"};
 
+// ============================================================================
+// Admittance tuning defaults (rebuild after editing).
+// Axis order for every array: x, y, z, roll, pitch, yaw.
+// Axes use frame A, aligned with BODY at activation and then fixed in WORLD.
+// ROS parameters can override these defaults.
+// M*q_ddot + D*q_dot + K*q = external wrench error.
+// Translation: M [kg], D [N*s/m], K [N/m].
+// Rotation: M [kg*m^2], D [N*m*s/rad], K [N*m/rad].
+// ============================================================================
+constexpr std::array<bool, kDof> axis_enabled_default = {
+  true,   // x
+  false,  // y
+  false,  // z
+  false,  // roll
+  false,  // pitch
+  false   // yaw
+};
+
+constexpr std::array<double, kDof> m_default = {1.0, 1.0, 1.0, 1.0, 1.00, 1.00};
+constexpr std::array<double, kDof> d_default = {20.0, 20.0, 20.0, 2.0, 2.0, 2.0};
+constexpr std::array<double, kDof> k_default = {0.0, 0.0, 0.0, 1.0, 1.0, 1.0};
+
+// Input deadband and saturation.
+constexpr std::array<double, kDof> deadband_default = {
+  0.05, 0.05, 0.05, 0.01, 0.01, 0.01};
+constexpr std::array<double, kDof> input_max_default = {
+  2.0, 2.0, 2.0, 0.50, 0.50, 0.50};
+
+// Virtual acceleration, velocity, and displacement limits.
+constexpr std::array<double, kDof> ddq_max_default = {
+  0.10, 0.10, 0.10,
+  30.0 * kDegToRad, 30.0 * kDegToRad, 30.0 * kDegToRad};
+constexpr std::array<double, kDof> dq_max_default = {
+  0.05, 0.05, 0.05,
+  10.0 * kDegToRad, 10.0 * kDegToRad, 10.0 * kDegToRad};
+constexpr std::array<double, kDof> q_max_default = {
+  0.15, 0.15, 0.15,
+  10.0 * kDegToRad, 10.0 * kDegToRad, 15.0 * kDegToRad};
+
+// Wrench low-pass cutoff frequencies [Hz], in the same axis order.
+constexpr std::array<double, kDof> cutoff_hz_default = {
+  10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
+// End of axis tuning defaults.
+
 Eigen::Matrix3d rotationWorldFromBody(const Eigen::Vector3d & rpy)
 {
   const double r = rpy.x();
@@ -121,7 +165,8 @@ public:
     // ------------------------------------------------------------------------
     const bool initially_enabled = declare_parameter<bool>("enabled", false);
     for (std::size_t i = 0; i < kDof; ++i) {
-      axis_enabled_[i] = declare_parameter<bool>("enable_" + kAxisNames[i], true);
+      axis_enabled_[i] = declare_parameter<bool>(
+        "enable_" + kAxisNames[i], axis_enabled_default[i]);
     }
 
     // Contact surface direction in BODY frame: robot -> contact surface.
@@ -177,10 +222,6 @@ public:
     // First 3 axes: [m, m/s] related translational motion.
     // Last 3 axes: [rad, rad/s] related rotational motion.
     // ------------------------------------------------------------------------
-    const std::array<double, kDof> m_default = {1.0, 1.0, 1.0, 1.0, 1.00, 1.00};
-    const std::array<double, kDof> d_default = {20.0, 20.0, 20.0, 2.0, 2.0, 2.0};
-    const std::array<double, kDof> k_default = {0.0, 0.0, 0.0, 1.0, 1.0, 1.0};
-
     for (std::size_t i = 0; i < kDof; ++i) {
       adm_m_[i] = std::max(
         std::abs(declare_parameter<double>("adm_m_" + kAxisNames[i], m_default[i])),
@@ -196,25 +237,9 @@ public:
     // ------------------------------------------------------------------------
     for (std::size_t i = 0; i < kDof; ++i) {
       cutoff_hz_[i] = std::max(
-        0.0, declare_parameter<double>("cutoff_" + kAxisNames[i] + "_hz", 10.0));
+        0.0, declare_parameter<double>(
+          "cutoff_" + kAxisNames[i] + "_hz", cutoff_hz_default[i]));
     }
-
-    // Input deadband and saturation.
-    const std::array<double, kDof> deadband_default = {
-      0.05, 0.05, 0.05, 0.01, 0.01, 0.01};
-    const std::array<double, kDof> input_max_default = {
-      2.0, 2.0, 2.0, 0.50, 0.50, 0.50};
-
-    // Virtual acceleration, velocity, and displacement limits.
-    const std::array<double, kDof> ddq_max_default = {
-      0.10, 0.10, 0.10,
-      30.0 * kDegToRad, 30.0 * kDegToRad, 30.0 * kDegToRad};
-    const std::array<double, kDof> dq_max_default = {
-      0.05, 0.05, 0.05,
-      10.0 * kDegToRad, 10.0 * kDegToRad, 10.0 * kDegToRad};
-    const std::array<double, kDof> q_max_default = {
-      0.15, 0.15, 0.15,
-      10.0 * kDegToRad, 10.0 * kDegToRad, 15.0 * kDegToRad};
 
     for (std::size_t i = 0; i < kDof; ++i) {
       input_deadband_[i] = std::abs(declare_parameter<double>(
@@ -796,9 +821,15 @@ private:
     cmd_msg.pos_cmd[2] = static_cast<float>(pos_ref_world.z());
 
     minitrone_interfaces::msg::AttitudeCmd att_msg;
-    att_msg.roll_ref = static_cast<float>(att_ref_rad.x() * kRadToDeg);
-    att_msg.pitch_ref = static_cast<float>(att_ref_rad.y() * kRadToDeg);
-    att_msg.yaw_ref = static_cast<float>(att_ref_rad.z() * kRadToDeg);
+    // The wrench controller adds this offset to the ordinary /att_cmd.
+    // Keep the full reference in /contact_method1/admittance_reference.
+    Eigen::Vector3d att_offset_rad = Eigen::Vector3d::Zero();
+    if (mode_ == Mode::ADMITTANCE) {
+      att_offset_rad = att_ref_rad - entry_att_ref_rad_;
+    }
+    att_msg.roll_ref = static_cast<float>(att_offset_rad.x() * kRadToDeg);
+    att_msg.pitch_ref = static_cast<float>(att_offset_rad.y() * kRadToDeg);
+    att_msg.yaw_ref = static_cast<float>(att_offset_rad.z() * kRadToDeg);
 
     pub_cmd_->publish(cmd_msg);
     pub_att_cmd_->publish(att_msg);
